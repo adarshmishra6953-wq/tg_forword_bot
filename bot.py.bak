@@ -1,0 +1,95 @@
+from telegram import Bot
+from telegram.ext import Updater, MessageHandler, Filters
+
+# --- CONFIGURATION ---
+bot_token = "8024252455:AAHBJ9ETOoGLKSdoc69w_8efLg6hvLu74KM"
+source_chat = "@ssc1234569"
+target_chat = "@mayaji12"
+# ----------------------
+
+# --- TEXT REPLACEMENTS (change as needed) ---
+replacements = {
+    "https://colorwiz1.com": "https://colorwiz1.com/promote/#/register?c=E2A837E0",
+    "@cw_robert": "@adarsh_01234"
+}
+# --- BLOCK WORDS (if any word present -> skip message) ---
+block_words = [
+    "feature",
+    "limit",
+    "telegram",
+    "@auto_forward_messages_bot",
+    "bot"
+]
+# -------------------------------------------------------
+
+def contains_block_word(text):
+    if not text:
+        return False
+    for word in block_words:
+        if word and word.lower() in text.lower():
+            return True
+    return False
+
+def forward_message(update, context):
+    try:
+        msg = update.effective_message
+        if not msg:
+            print("Skipped: no effective message")
+            return
+
+        # TEXT messages
+        if msg.text:
+            text = msg.text
+            if contains_block_word(text):
+                print("🚫 Blocked text message")
+                return
+            for old, new in replacements.items():
+                text = text.replace(old, new)
+            context.bot.send_message(chat_id=target_chat, text=text, disable_web_page_preview=True)
+            print("Sent text:", getattr(msg, "message_id", "N/A"))
+            return
+
+        # Photo with caption
+        if msg.photo and msg.caption:
+            caption = msg.caption
+            if contains_block_word(caption):
+                print("🚫 Blocked photo caption")
+                return
+            for old, new in replacements.items():
+                caption = caption.replace(old, new)
+            context.bot.send_photo(chat_id=target_chat, photo=msg.photo[-1].file_id, caption=caption)
+            print("Sent photo with caption:", getattr(msg, "message_id", "N/A"))
+            return
+
+        # Photo without caption
+        if msg.photo:
+            context.bot.send_photo(chat_id=target_chat, photo=msg.photo[-1].file_id)
+            print("Sent photo:", getattr(msg, "message_id", "N/A"))
+            return
+
+        # Document / audio / sticker / other -> try copy as fallback
+        try:
+            if msg.message_id:
+                context.bot.copy_message(chat_id=target_chat, from_chat_id=msg.chat.id, message_id=msg.message_id)
+                print("Copied message id:", msg.message_id)
+                return
+        except Exception as e:
+            print("Copy fallback failed:", e)
+
+        print("Skipped unknown message type")
+
+    except Exception as e:
+        print("Error while processing:", e)
+
+def main():
+    updater = Updater(token=bot_token, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(MessageHandler(Filters.all, forward_message))
+    print("🚀 Bot started. Listening for messages...")
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
+
+
