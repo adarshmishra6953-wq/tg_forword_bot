@@ -8,7 +8,7 @@ import re
 import time
 from datetime import datetime
 from threading import Lock
-
+import imghdr
 from telegram import Bot, Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
