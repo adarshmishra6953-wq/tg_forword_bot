@@ -6,7 +6,7 @@ import os
 import json
 import re
 import time
-from datetime import datetimeR
+from datetime import datetime
 from threading import Lock
 import imghdr
 from telegram import Bot, Update
