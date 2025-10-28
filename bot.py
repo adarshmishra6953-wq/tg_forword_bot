@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # webhook-ready advanced forward bot for python-telegram-bot v13.15
 # (copy this entire file into ~/tg_forward_bot/bot.py)
-
+# updated for imghdr fix
 import os
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetimeR
 from threading import Lock
 import imghdr
 from telegram import Bot, Update
