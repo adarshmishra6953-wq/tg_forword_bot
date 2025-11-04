@@ -502,7 +502,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.ALL, forward_message, channel_post_updates=True))
+    application.add_handler(MessageHandler(filters.ALL, forward_message))
     
     # Webhook Setup for Render
     PORT = int(os.environ.get("PORT", "8443"))
