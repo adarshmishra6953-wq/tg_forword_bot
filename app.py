@@ -28,7 +28,8 @@ SET_SOURCE, SET_DESTINATION, SET_REPLACEMENT_FIND, SET_REPLACEMENT_REPLACE, SET_
 # 2. Database Setup (SQLAlchemy)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    logger.error("DATABASE_URL environment variable is not set. Bot will not save settings.")
+    # Changed from logger.error to logger.warning as script can technically run without DB
+    logger.warning("DATABASE_URL environment variable is not set. Bot will not save settings.")
 
 # Adjust URL format for Render/Heroku PostgreSQL compatibility
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
@@ -80,6 +81,7 @@ def load_config_from_db():
             logger.info("New BotConfig entry created in DB.")
     except Exception as e:
         logger.error(f"Error loading config from DB: {e}")
+        # Return a temporary config in case of DB read error
         config = BotConfig(id=1, IS_FORWARDING_ACTIVE=False, TEXT_REPLACEMENTS={}, WORD_BLACKLIST=[], WORD_WHITELIST=[])
     finally:
         session.close()
@@ -419,11 +421,13 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     if not config.IS_FORWARDING_ACTIVE: return
     source_id_str = config.SOURCE_CHAT_ID
+    # Check if the message comes from the set source ID(s)
     if not (source_id_str and str(message.chat.id) in source_id_str): return
 
     dest_id = config.DESTINATION_CHAT_ID
     if not dest_id:
         if config.ADMIN_USER_ID:
+            # Inform admin if destination is missing
             await context.bot.send_message(config.ADMIN_USER_ID, f"Source Message aaya, lekin Destination ID set nahi hai!")
         return
 
@@ -502,22 +506,25 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Message handler without the redundant channel_post_updates argument (Fix 1: TypeError)
+    # We use filters.ALL to catch both normal messages and channel posts
     application.add_handler(MessageHandler(filters.ALL, forward_message))
     
-    # Webhook Setup for Render
-    PORT = int(os.environ.get("PORT", "8443"))
+    # Webhook Setup for Render (Fix 2: Timed out port binding)
+    PORT = int(os.environ.get("PORT", "8080")) # Use 8080 as a robust default for web services
     WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
     if WEBHOOK_URL:
-        logger.info(f"Starting bot with Webhook on URL: {WEBHOOK_URL}")
+        logger.info(f"Starting bot with Webhook on URL: {WEBHOOK_URL} using port {PORT}")
         application.run_webhook(
-            listen="0.0.0.0",
+            listen="0.0.0.0", # This ensures binding to the host's public IP
             port=PORT,
             url_path=BOT_TOKEN,
             webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
         )
     else:
-        logger.warning("WEBHOOK_URL not set. Falling back to Polling.")
+        logger.warning("WEBHOOK_URL not set. Falling back to Polling. (Not recommended for Render Web Services)")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
