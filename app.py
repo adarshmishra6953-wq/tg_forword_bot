@@ -66,6 +66,12 @@ if Engine:
     except OperationalError as e:
         logger.error(f"Database connection error during table creation: {e}")
 
+# === VAHAN JODEIN JAHAN GLOBAL_CONFIG load kiya jata hai ===
+# Example: Use your actual Telegram User ID here to force admin status
+# Isse ADMIN_USER_ID hamesha set rahega, bhale hi DB reset ho jaye.
+# APNI ASLI TELEGRAM USER ID YAHAN DALEN (e.g., 1234567890)
+FORCE_ADMIN_ID = 1695450646 # <--- **APKI ID YAHAN SET HAI**
+
 # 4. Configuration Management Functions
 def load_config_from_db():
     """Load configuration from DB or return a default/error state."""
@@ -92,7 +98,7 @@ def load_config_from_db():
     # Ensure FORWARDING_MODE exists for older databases
     if not hasattr(config, 'FORWARDING_MODE') or config.FORWARDING_MODE is None:
         config.FORWARDING_MODE = 'FORWARD'
-        # Note: We don't save immediately here to avoid unnecessary DB write on every load if the field was just added.
+        # No immediate save needed here.
         
     return config
 
@@ -192,7 +198,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Reload config to ensure we have the latest state on every /start
     GLOBAL_CONFIG = load_config_from_db()
 
-    if GLOBAL_CONFIG.ADMIN_USER_ID is None:
+    # FORCE ADMIN ID: Agar FORCE_ADMIN_ID set hai, to use hi use karein
+    if FORCE_ADMIN_ID and GLOBAL_CONFIG.ADMIN_USER_ID != FORCE_ADMIN_ID:
+        GLOBAL_CONFIG.ADMIN_USER_ID = FORCE_ADMIN_ID
+        save_config_to_db(GLOBAL_CONFIG)
+        logger.info(f"Admin User ID forcibly set to: {FORCE_ADMIN_ID}")
+    
+    elif GLOBAL_CONFIG.ADMIN_USER_ID is None:
         GLOBAL_CONFIG.ADMIN_USER_ID = user_id
         save_config_to_db(GLOBAL_CONFIG)
         logger.info(f"Admin User ID set to: {user_id}")
@@ -215,7 +227,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
 
     # Admin Check (Ensures only admin can change settings)
-    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and chat_id != GLOBAL_CONFIG.ADMIN_USER_ID:
+    # Check if chat_id matches saved Admin ID OR the forced Admin ID
+    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and chat_id != FORCE_ADMIN_ID:
         await query.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
         return
 
@@ -363,7 +376,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, config_attr: str) -> int:
     """Utility function to handle receiving chat ID/Username."""
     global GLOBAL_CONFIG
-    if update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID:
+    # Check against saved Admin ID AND forced Admin ID
+    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
         await update.message.reply_text("Aap Bot ke Admin nahi hain.")
         return ConversationHandler.END
 
@@ -392,7 +406,8 @@ async def set_destination_id(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def set_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE, list_name: str, callback_menu: str) -> int:
     """Adds a word to Blacklist or Whitelist."""
     global GLOBAL_CONFIG
-    if update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID:
+    # Check against saved Admin ID AND forced Admin ID
+    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
         await update.message.reply_text("Aap Bot ke Admin nahi hain.")
         return ConversationHandler.END
     
@@ -422,7 +437,8 @@ async def set_whitelist_word(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def set_replacement_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Gets the 'find' text and asks for the 'replace' text."""
-    if update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID:
+    # Check against saved Admin ID AND forced Admin ID
+    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
         await update.message.reply_text("Aap Bot ke Admin nahi hain.")
         return ConversationHandler.END
     
@@ -436,7 +452,8 @@ async def set_replacement_find(update: Update, context: ContextTypes.DEFAULT_TYP
 async def set_replacement_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Gets the 'replace' text and saves the replacement rule."""
     global GLOBAL_CONFIG
-    if update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID:
+    # Check against saved Admin ID AND forced Admin ID
+    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
         await update.message.reply_text("Aap Bot ke Admin nahi hain.")
         return ConversationHandler.END
 
@@ -471,9 +488,9 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     dest_id = config.DESTINATION_CHAT_ID
     if not dest_id:
-        if config.ADMIN_USER_ID:
-            # Inform admin if destination is missing
-            await context.bot.send_message(config.ADMIN_USER_ID, f"Source Message aaya, lekin Destination ID set nahi hai!")
+        if config.ADMIN_USER_ID or FORCE_ADMIN_ID: # Use OR force admin ID for notification
+            admin_to_notify = config.ADMIN_USER_ID or FORCE_ADMIN_ID
+            await context.bot.send_message(admin_to_notify, f"Source Message aaya, lekin Destination ID set nahi hai!")
         return
 
     text_to_process = message.text or message.caption or ""
