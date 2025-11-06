@@ -456,7 +456,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 break
         if not is_whitelisted: return
 
-    # FIX 1: Text Replacement Logic with modification tracking and time import
+    # Text Replacement Logic with modification tracking 
     final_text = text_to_process
     text_modified = False 
     
@@ -470,7 +470,8 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if config.FORWARD_DELAY_SECONDS > 0:
         time.sleep(config.FORWARD_DELAY_SECONDS)
 
-    # FIX 2 & 3: Final Forwarding (Safely handles modified text, empty text, and fixes the '_parse_mode' error)
+    # FIX: Final Forwarding Logic (Using `forward_message` if no modifications, and `copy_message/send_message` if modified)
+    # If text was modified, we set parse_mode to None to avoid format errors, otherwise use original parse_mode.
     final_parse_mode = None if text_modified else message.parse_mode
     
     try:
@@ -479,12 +480,12 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             if final_text and final_text.strip(): # Check if the final text is NOT empty
                 
-                # Use send_message for simple text messages
-                if message.text:
+                # Use send_message for simple text messages (no media)
+                if message.text and not message.photo and not message.video and not message.document:
                     await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
                 
-                # Use copy_message for media messages with captions
-                elif message.caption:
+                # Use copy_message for media messages with captions, or if text replacement happened on a media caption
+                elif message.caption or message.photo or message.video or message.document:
                      await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption=final_text, parse_mode=final_parse_mode)
             
             # If text is empty (after replacement) but there is media, send media without caption
@@ -493,8 +494,8 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # ELSE: If text is empty and no media, do nothing (skip forwarding)
             
         else:
-            # --- Case 2: Text was NOT modified (Forward using the safest method) ---
-            # Use forward_message when no edits are needed (avoids the message.copy() issues).
+            # --- Case 2: Text was NOT modified (Forward everything else using the safest method) ---
+            # Use forward_message when no edits are needed.
             await context.bot.forward_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id)
 
     except Exception as e:
