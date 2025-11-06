@@ -154,7 +154,11 @@ def create_main_menu_keyboard(config):
             InlineKeyboardButton("⏸️ Rokein" if config.IS_FORWARDING_ACTIVE else "▶️ Shuru Karein", callback_data='toggle_forwarding'),
             InlineKeyboardButton("🔄 Bot Settings Refresh", callback_data='refresh_config')
         ],
-        [InlineKeyboardButton("⚙️ Current Settings Dekhein", callback_data='show_settings')]
+        [
+            InlineKeyboardButton("⚙️ Current Settings Dekhein", callback_data='show_settings'),
+            # FIX: New button to help copy destination messages
+            InlineKeyboardButton("📋 Destination Message Copy Karein", url=f"https://t.me/share/url?url=t.me/{config.DESTINATION_CHAT_ID}"),
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -452,27 +456,47 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 break
         if not is_whitelisted: return
 
-    # Text Replacement
+    # FIX 1: Text Replacement Logic with modification tracking and time import
     final_text = text_to_process
-    if config.TEXT_REPLACEMENTS:
+    text_modified = False 
+    
+    if config.TEXT_REPLACEMENTS and final_text:
         for find, replace in config.TEXT_REPLACEMENTS.items():
-            final_text = final_text.replace(find, replace)
-
+            if find in final_text:
+                final_text = final_text.replace(find, replace)
+                text_modified = True
+                
     # Apply Delay
     if config.FORWARD_DELAY_SECONDS > 0:
         time.sleep(config.FORWARD_DELAY_SECONDS)
 
-    # Final Forwarding (Use copy_message to remove 'Forwarded from' tag and handle text changes)
+    # FIX 2 & 3: Final Forwarding (Safely handles modified text, empty text, and fixes the '_parse_mode' error)
+    final_parse_mode = None if text_modified else message.parse_mode
+    
     try:
-        if final_text != text_to_process and (message.text or message.caption):
-            # Send message/copy media with modified text/caption
-            if message.text:
-                await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=message.parse_mode, disable_web_page_preview=True)
-            elif message.caption:
-                 await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption=final_text, parse_mode=message.parse_mode)
+        if text_modified:
+            # --- Case 1: Text was modified (Handle all possibilities) ---
+            
+            if final_text and final_text.strip(): # Check if the final text is NOT empty
+                
+                # Use send_message for simple text messages
+                if message.text:
+                    await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
+                
+                # Use copy_message for media messages with captions
+                elif message.caption:
+                     await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption=final_text, parse_mode=final_parse_mode)
+            
+            # If text is empty (after replacement) but there is media, send media without caption
+            elif message.photo or message.video or message.document or message.sticker or message.audio or message.voice:
+                await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption="")
+            # ELSE: If text is empty and no media, do nothing (skip forwarding)
+            
         else:
-            # Simple copy if no text modification
-            await message.copy(chat_id=dest_id)
+            # --- Case 2: Text was NOT modified (Forward using the safest method) ---
+            # Use forward_message when no edits are needed (avoids the message.copy() issues).
+            await context.bot.forward_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id)
+
     except Exception as e:
         logger.error(f"Error copying/sending message: {e}")
             
