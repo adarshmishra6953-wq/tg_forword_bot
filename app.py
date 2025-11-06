@@ -62,7 +62,14 @@ class BotConfig(Base):
 # Create tables if Engine is available
 if Engine:
     try:
+        # --- RESET LINE ADDED FOR FIX ---
+        # Purani table ko delete karke naya banao. Isse database reset ho jayega.
+        # AGAR DEPLOY SAFAL HO JAYE TOH IS LINE KO TURANT HATA DENA HAI (Agle step mein dekhein)
+        Base.metadata.drop_all(Engine) 
+        # --------------------------------
+        
         Base.metadata.create_all(Engine)
+        logger.info("Database table created/recreated successfully.")
     except OperationalError as e:
         logger.error(f"Database connection error during table creation: {e}")
 
