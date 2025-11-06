@@ -52,6 +52,9 @@ class BotConfig(Base):
     FORWARD_DELAY_SECONDS = Column(Integer, default=0)
     ADMIN_USER_ID = Column(Integer)
     
+    # NEW FIELD: 'FORWARD' (default) or 'COPY'
+    FORWARDING_MODE = Column(String, default='FORWARD') 
+    
     TEXT_REPLACEMENTS = Column(PickleType, default={})
     WORD_BLACKLIST = Column(PickleType, default=[]) 
     WORD_WHITELIST = Column(PickleType, default=[]) 
@@ -85,6 +88,12 @@ def load_config_from_db():
         config = BotConfig(id=1, IS_FORWARDING_ACTIVE=False, TEXT_REPLACEMENTS={}, WORD_BLACKLIST=[], WORD_WHITELIST=[])
     finally:
         session.close()
+    
+    # Ensure FORWARDING_MODE exists for older databases
+    if not hasattr(config, 'FORWARDING_MODE') or config.FORWARDING_MODE is None:
+        config.FORWARDING_MODE = 'FORWARD'
+        # Note: We don't save immediately here to avoid unnecessary DB write on every load if the field was just added.
+        
     return config
 
 def save_config_to_db(config):
@@ -111,6 +120,9 @@ def get_current_settings_text(config):
     links = "Haa" if config.BLOCK_LINKS else "Nahi"
     usernames = "Haa" if config.BLOCK_USERNAMES else "Nahi"
     
+    # Get Mode Text
+    mode_text = "Forward (Original)" if config.FORWARDING_MODE == 'FORWARD' else "Copy (Caption Edit Possible)"
+
     replacements_list = "\n".join(
         [f"   - '{f}' -> '{r}'" for f, r in (config.TEXT_REPLACEMENTS or {}).items()]
     ) if (config.TEXT_REPLACEMENTS and len(config.TEXT_REPLACEMENTS) > 0) else "Koi Niyam Set Nahi"
@@ -119,7 +131,8 @@ def get_current_settings_text(config):
     whitelist_list = ", ".join(config.WORD_WHITELIST or []) if (config.WORD_WHITELIST and len(config.WORD_WHITELIST) > 0) else "Koi Shabdh Jaruri Nahi"
 
     return (
-        f"**Bot Status:** `{status}`\n\n"
+        f"**Bot Status:** `{status}`\n"
+        f"**Forwarding Mode:** `{mode_text}`\n\n"
         f"**Source ID:** `{config.SOURCE_CHAT_ID or 'Set Nahi'}`\n"
         f"**Destination ID:** `{config.DESTINATION_CHAT_ID or 'Set Nahi'}`\n\n"
         f"**Filters:**\n"
@@ -151,12 +164,16 @@ def create_main_menu_keyboard(config):
             InlineKeyboardButton("✅ Whitelist Manage Karein", callback_data='menu_whitelist')
         ],
         [
-            InlineKeyboardButton("⏸️ Rokein" if config.IS_FORWARDING_ACTIVE else "▶️ Shuru Karein", callback_data='toggle_forwarding'),
+            # New button for Forwarding Mode
+            InlineKeyboardButton(f"📨 Mode: {'COPY' if config.FORWARDING_MODE == 'COPY' else 'FORWARD'}", callback_data='menu_forwarding_mode'),
             InlineKeyboardButton("🔄 Bot Settings Refresh", callback_data='refresh_config')
         ],
         [
+            InlineKeyboardButton("⏸️ Rokein" if config.IS_FORWARDING_ACTIVE else "▶️ Shuru Karein", callback_data='toggle_forwarding'),
             InlineKeyboardButton("⚙️ Current Settings Dekhein", callback_data='show_settings'),
-            # FIX: New button to help copy destination messages
+        ],
+        [
+            # Button to help copy destination messages (as requested)
             InlineKeyboardButton("📋 Destination Message Copy Karein", url=f"https://t.me/share/url?url=t.me/{config.DESTINATION_CHAT_ID}"),
         ]
     ]
@@ -267,6 +284,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return ConversationHandler.END
+
+    # --- NEW: Forwarding Mode Menu ---
+    elif data == 'menu_forwarding_mode':
+        keyboard = [
+            [InlineKeyboardButton(f"1. Forward (Original) {'✅' if GLOBAL_CONFIG.FORWARDING_MODE == 'FORWARD' else '❌'}", callback_data='set_mode_forward')],
+            [InlineKeyboardButton(f"2. Copy (Caption Editing) {'✅' if GLOBAL_CONFIG.FORWARDING_MODE == 'COPY' else '❌'}", callback_data='set_mode_copy')],
+            [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]
+        ]
+        await query.edit_message_text("Message Forwarding ka **Mode** chunein:\n\n*1. Forward*: Message ka format original rehta hai. Yeh tabhi Copy hota hai jab Text Replacement kiya jata hai.\n*2. Copy*: Hamesha Copy hoga, jisse aapka Text Replacement niyam hamesha lagu ho aur original caption bhi hataya ja sake.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+
+    elif data.startswith('set_mode_'):
+        mode = data.split('_')[2].upper()
+        GLOBAL_CONFIG.FORWARDING_MODE = mode
+        save_config_to_db(GLOBAL_CONFIG)
+        await query.edit_message_text(
+            f"**Forwarding Mode** ab `{mode}` set kar diya gaya hai.\n\n"
+            f"Current Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}",
+            reply_markup=create_back_keyboard(),
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    # --- END NEW: Forwarding Mode Menu ---
+
 
     # --- Blacklist/Whitelist/Replacement Menus (Similar structure to be handled in conversation) ---
     elif data == 'menu_blacklist':
@@ -470,44 +511,44 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if config.FORWARD_DELAY_SECONDS > 0:
         time.sleep(config.FORWARD_DELAY_SECONDS)
 
-    # FIX: Correctly handle final_parse_mode to avoid AttributeError
-    # Use parse_mode only if the message has a text/caption and we didn't modify the text.
-    # Otherwise, set it to None.
+    # --- CORE FORWARDING MODE LOGIC ---
     
-    # Check if original message had a parse_mode (using getattr to avoid AttributeError on non-text messages like stickers/photos without caption)
+    # Decide whether to use copy_message based on 1. Text modification or 2. Explicit 'COPY' mode setting
+    force_copy = text_modified or (config.FORWARDING_MODE == 'COPY')
+    
+    # Check if original message had a parse_mode (using getattr for safety)
     original_parse_mode = getattr(message, 'parse_mode', None)
 
-    # Set final parse mode: If text was modified, we set it to None to avoid format errors, 
-    # otherwise we use the original mode if it existed.
+    # Set final parse mode: Only use original parse mode if mode is FORWARD AND no text modification happened.
     final_parse_mode = None 
-    if not text_modified and original_parse_mode:
+    if config.FORWARDING_MODE == 'FORWARD' and not text_modified and original_parse_mode:
         final_parse_mode = original_parse_mode
     
     try:
-        if text_modified:
-            # --- Case 1: Text was modified (Handle all possibilities) ---
+        if force_copy:
+            # --- Case 1: Use copy_message (due to text modification OR 'COPY' mode) ---
             
-            if final_text and final_text.strip(): # Check if the final text is NOT empty
-                
-                # Use send_message for simple text messages (no media/caption)
-                if message.text and not message.caption:
-                    await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
-                
-                # Use copy_message for media messages with captions, or if text replacement happened on a media caption
-                elif message.caption or message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
-                     # For copy_message, pass caption even if it's an empty string.
-                     final_caption = final_text if message.caption else "" # Only apply text if the message originally had a caption, otherwise keep it empty if only text was modified but it was just a message text
-                     await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption=final_text, parse_mode=final_parse_mode)
-            
-            # If text is empty (after replacement) but there is media, send media without caption
-            elif message.photo or message.video or message.document or message.sticker or message.audio or message.voice:
-                # IMPORTANT: Send empty caption to remove original caption but keep media
-                await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption="")
-            # ELSE: If text is empty and no media, do nothing (skip forwarding)
+            # Message is pure text (no media)
+            if message.text and not message.caption and not message.photo and not message.video and not message.document:
+                if final_text and final_text.strip():
+                     await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
+                # If text became empty, skip.
+
+            # Message has media (photo, video, document, etc.)
+            elif message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
+                # If final_text is empty, we send media with empty caption (removing original caption)
+                # If final_text exists, we send media with new caption
+                caption_to_send = final_text if final_text else ""
+                await context.bot.copy_message(
+                    chat_id=dest_id, 
+                    from_chat_id=message.chat.id, 
+                    message_id=message.message_id, 
+                    caption=caption_to_send, 
+                    parse_mode=final_parse_mode
+                )
             
         else:
-            # --- Case 2: Text was NOT modified (Forward everything else using the safest method) ---
-            # Use forward_message when no edits are needed.
+            # --- Case 2: Use forward_message ('FORWARD' mode and no modifications) ---
             await context.bot.forward_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id)
 
     except Exception as e:
@@ -544,11 +585,10 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Message handler without the redundant channel_post_updates argument (Fix 1: TypeError)
-    # We use filters.ALL to catch both normal messages and channel posts
+    # Message handler for forwarding logic
     application.add_handler(MessageHandler(filters.ALL, forward_message))
     
-    # Webhook Setup for Render (Fix 2: Timed out port binding)
+    # Webhook Setup for Render/Deployment
     PORT = int(os.environ.get("PORT", "8080")) # Use 8080 as a robust default for web services
     WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
