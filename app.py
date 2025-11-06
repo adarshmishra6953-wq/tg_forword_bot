@@ -62,22 +62,15 @@ class BotConfig(Base):
 # Create tables if Engine is available
 if Engine:
     try:
-        # --- RESET LINE ADDED FOR FIX ---
-        # Purani table ko delete karke naya banao. Isse database reset ho jayega.
-        # AGAR DEPLOY SAFAL HO JAYE TOH IS LINE KO TURANT HATA DENA HAI (Agle step mein dekhein)
-        Base.metadata.drop_all(Engine) 
-        # --------------------------------
-        
+        # --- FIX: drop_all line ko permanently hata diya gaya hai ---
         Base.metadata.create_all(Engine)
         logger.info("Database table created/recreated successfully.")
     except OperationalError as e:
         logger.error(f"Database connection error during table creation: {e}")
 
-# === VAHAN JODEIN JAHAN GLOBAL_CONFIG load kiya jata hai ===
 # Example: Use your actual Telegram User ID here to force admin status
-# Isse ADMIN_USER_ID hamesha set rahega, bhale hi DB reset ho jaye.
-# APNI ASLI TELEGRAM USER ID YAHAN DALEN (e.g., 1234567890)
-FORCE_ADMIN_ID = 1695450646 # <--- **APKI ID YAHAN SET HAI**
+# APNI ASLI TELEGRAM USER ID YAHAN SET HAI
+FORCE_ADMIN_ID = 1695450646 
 
 # 4. Configuration Management Functions
 def load_config_from_db():
@@ -87,6 +80,7 @@ def load_config_from_db():
         return BotConfig(id=1, IS_FORWARDING_ACTIVE=False, TEXT_REPLACEMENTS={}, WORD_BLACKLIST=[], WORD_WHITELIST=[], ADMIN_USER_ID=None)
 
     session = Session()
+    config = None
     try:
         config = session.query(BotConfig).first()
         if not config:
@@ -95,17 +89,22 @@ def load_config_from_db():
             session.add(config)
             session.commit()
             logger.info("New BotConfig entry created in DB.")
+        
+        # --- FIX: DetachedInstanceError se bachne ke liye expunge use karein ---
+        # session.close() se pehle object ko session se alag kar de
+        session.expunge(config) 
+        # -------------------------------------------------------------------
+        
     except Exception as e:
         logger.error(f"Error loading config from DB: {e}")
         # Return a temporary config in case of DB read error
         config = BotConfig(id=1, IS_FORWARDING_ACTIVE=False, TEXT_REPLACEMENTS={}, WORD_BLACKLIST=[], WORD_WHITELIST=[])
     finally:
-        session.close()
+        session.close() # Session ko hamesha close karna chahiye
     
     # Ensure FORWARDING_MODE exists for older databases
     if not hasattr(config, 'FORWARDING_MODE') or config.FORWARDING_MODE is None:
         config.FORWARDING_MODE = 'FORWARD'
-        # No immediate save needed here.
         
     return config
 
@@ -115,7 +114,8 @@ def save_config_to_db(config):
     
     session = Session()
     try:
-        session.merge(config)
+        # Configuration object ko session mein merge karein taaki uski state track ho sake
+        session.merge(config) 
         session.commit()
     except Exception as e:
         logger.error(f"Error saving config to DB: {e}")
