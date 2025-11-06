@@ -470,9 +470,18 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if config.FORWARD_DELAY_SECONDS > 0:
         time.sleep(config.FORWARD_DELAY_SECONDS)
 
-    # FIX: Final Forwarding Logic (Using `forward_message` if no modifications, and `copy_message/send_message` if modified)
-    # If text was modified, we set parse_mode to None to avoid format errors, otherwise use original parse_mode.
-    final_parse_mode = None if text_modified else message.parse_mode
+    # FIX: Correctly handle final_parse_mode to avoid AttributeError
+    # Use parse_mode only if the message has a text/caption and we didn't modify the text.
+    # Otherwise, set it to None.
+    
+    # Check if original message had a parse_mode (using getattr to avoid AttributeError on non-text messages like stickers/photos without caption)
+    original_parse_mode = getattr(message, 'parse_mode', None)
+
+    # Set final parse mode: If text was modified, we set it to None to avoid format errors, 
+    # otherwise we use the original mode if it existed.
+    final_parse_mode = None 
+    if not text_modified and original_parse_mode:
+        final_parse_mode = original_parse_mode
     
     try:
         if text_modified:
@@ -480,16 +489,19 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             if final_text and final_text.strip(): # Check if the final text is NOT empty
                 
-                # Use send_message for simple text messages (no media)
-                if message.text and not message.photo and not message.video and not message.document:
+                # Use send_message for simple text messages (no media/caption)
+                if message.text and not message.caption:
                     await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
                 
                 # Use copy_message for media messages with captions, or if text replacement happened on a media caption
-                elif message.caption or message.photo or message.video or message.document:
+                elif message.caption or message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
+                     # For copy_message, pass caption even if it's an empty string.
+                     final_caption = final_text if message.caption else "" # Only apply text if the message originally had a caption, otherwise keep it empty if only text was modified but it was just a message text
                      await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption=final_text, parse_mode=final_parse_mode)
             
             # If text is empty (after replacement) but there is media, send media without caption
             elif message.photo or message.video or message.document or message.sticker or message.audio or message.voice:
+                # IMPORTANT: Send empty caption to remove original caption but keep media
                 await context.bot.copy_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id, caption="")
             # ELSE: If text is empty and no media, do nothing (skip forwarding)
             
