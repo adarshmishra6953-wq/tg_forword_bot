@@ -1,4 +1,4 @@
-import os
+Import os
 import logging
 import time
 import re
@@ -12,7 +12,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import OperationalError
 
@@ -23,12 +23,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation States (Ensure these are unique integers)
-SET_SOURCE, SET_DESTINATION, SET_REPLACEMENT_FIND, SET_REPLACEMENT_REPLACE, SET_BLACKLIST_WORD, SET_WHITELIST_WORD = range(6)
+(
+    SET_RULE_NAME,
+    SET_SOURCE_ID,
+    SET_DESTINATION_ID,
+    SET_REPLACEMENT_FIND,
+    SET_REPLACEMENT_REPLACE,
+    SET_BLACKLIST_WORD,
+    SET_WHITELIST_WORD,
+    SET_PREFIX_TEXT,
+    SET_SUFFIX_TEXT,
+    SET_MESSAGE_FOR_BUTTONS,
+    SET_BUTTON_DATA,
+    SELECT_RULE_FOR_ACTION
+) = range(12) # Range updated from 13 to 12 as SET_TARGET_LANG is removed
 
 # 2. Database Setup (SQLAlchemy)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    # Changed from logger.error to logger.warning as script can technically run without DB
     logger.warning("DATABASE_URL environment variable is not set. Bot will not save settings.")
 
 # Adjust URL format for Render/Heroku PostgreSQL compatibility
@@ -39,157 +51,287 @@ Engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 Base = declarative_base()
 Session = sessionmaker(bind=Engine)
 
-# 3. Database Model (All bot settings are stored here)
-class BotConfig(Base):
-    __tablename__ = 'config'
+# 3. Database Model (Refactored to remove Translation fields)
+class ForwardRule(Base):
+    """Stores configuration for one Source -> Destination forwarding rule."""
+    __tablename__ = 'forward_rules'
     id = Column(Integer, primary_key=True)
+    rule_name = Column(String, unique=True)
     
-    SOURCE_CHAT_ID = Column(String)
+    # Core
+    SOURCE_CHAT_ID = Column(String) # Can be comma-separated list of IDs/Usernames
     DESTINATION_CHAT_ID = Column(String)
-    IS_FORWARDING_ACTIVE = Column(Boolean, default=True)
+    IS_ACTIVE = Column(Boolean, default=True)
+    FORWARDING_MODE = Column(String, default='COPY') # Default changed to COPY for max flexibility
+    FORWARD_DELAY_SECONDS = Column(Integer, default=0)
+    
+    # Text Customization (New)
+    PREFIX_TEXT = Column(Text, default="")
+    SUFFIX_TEXT = Column(Text, default="")
+    
+    # Filters/Actions
     BLOCK_LINKS = Column(Boolean, default=False)
     BLOCK_USERNAMES = Column(Boolean, default=False)
-    FORWARD_DELAY_SECONDS = Column(Integer, default=0)
-    ADMIN_USER_ID = Column(Integer)
+    BLOCK_MEDIA = Column(Boolean, default=False)
+    BLOCK_FORWARDS = Column(Boolean, default=False)
+    REMOVE_WEB_PREVIEW = Column(Boolean, default=False)
+    REMOVE_BUTTONS = Column(Boolean, default=True) # Default to True as per user request
+    REMOVE_CAPTION = Column(Boolean, default=False) # New
+    SILENT_FORWARDING = Column(Boolean, default=False) # New
+    BLOCK_SERVICE_MESSAGES = Column(Boolean, default=True) # New (Good default)
+    BLOCK_REPLIES = Column(Boolean, default=False) # New
     
-    # NEW FIELD: 'FORWARD' (default) or 'COPY'
-    FORWARDING_MODE = Column(String, default='FORWARD') 
-    
+    # List Data
     TEXT_REPLACEMENTS = Column(PickleType, default={})
     WORD_BLACKLIST = Column(PickleType, default=[]) 
-    WORD_WHITELIST = Column(PickleType, default=[]) 
+    WORD_WHITELIST = Column(PickleType, default=[])
 
 # Create tables if Engine is available
 if Engine:
     try:
-        # --- FIX: drop_all line ko permanently hata diya gaya hai ---
+        # This will create the new table and any new columns in existing DBs
         Base.metadata.create_all(Engine)
-        logger.info("Database table created/recreated successfully.")
+        logger.info("Database table created/updated successfully.")
     except OperationalError as e:
-        logger.error(f"Database connection error during table creation: {e}")
+        logger.error(f"Database connection error during table creation/update: {e}")
 
 # Example: Use your actual Telegram User ID here to force admin status
 # APNI ASLI TELEGRAM USER ID YAHAN SET HAI
 FORCE_ADMIN_ID = 1695450646 
 
 # 4. Configuration Management Functions
-def load_config_from_db():
-    """Load configuration from DB or return a default/error state."""
-    if not Engine:
-        # Return a temporary config if DB is missing (settings will not save)
-        return BotConfig(id=1, IS_FORWARDING_ACTIVE=False, TEXT_REPLACEMENTS={}, WORD_BLACKLIST=[], WORD_WHITELIST=[], ADMIN_USER_ID=None)
-
-    session = Session()
-    config = None
-    try:
-        config = session.query(BotConfig).first()
-        if not config:
-            # Create default entry if DB is empty
-            config = BotConfig(id=1)
-            session.add(config)
-            session.commit()
-            logger.info("New BotConfig entry created in DB.")
-        
-        # --- FIX: DetachedInstanceError se bachne ke liye expunge use karein ---
-        # session.close() se pehle object ko session se alag kar de
-        session.expunge(config) 
-        # -------------------------------------------------------------------
-        
-    except Exception as e:
-        logger.error(f"Error loading config from DB: {e}")
-        # Return a temporary config in case of DB read error
-        config = BotConfig(id=1, IS_FORWARDING_ACTIVE=False, TEXT_REPLACEMENTS={}, WORD_BLACKLIST=[], WORD_WHITELIST=[])
-    finally:
-        session.close() # Session ko hamesha close karna chahiye
-    
-    # Ensure FORWARDING_MODE exists for older databases
-    if not hasattr(config, 'FORWARDING_MODE') or config.FORWARDING_MODE is None:
-        config.FORWARDING_MODE = 'FORWARD'
-        
-    return config
-
-def save_config_to_db(config):
-    """Save the provided configuration object back to the database."""
-    if not Engine: return
-    
+def get_all_rules():
+    """Load all rules from DB."""
+    if not Engine: return []
     session = Session()
     try:
-        # Configuration object ko session mein merge karein taaki uski state track ho sake
-        session.merge(config) 
-        session.commit()
+        rules = session.query(ForwardRule).all()
+        # Detach objects from session for safe use outside
+        session.expunge_all() 
+        return rules
     except Exception as e:
-        logger.error(f"Error saving config to DB: {e}")
+        logger.error(f"Error loading all rules: {e}")
+        return []
     finally:
         session.close()
 
-# Global config instance (Loaded on startup)
-GLOBAL_CONFIG = load_config_from_db()
+def get_rule_by_id(rule_id):
+    """Load a single rule by its ID."""
+    if not Engine: return None
+    session = Session()
+    try:
+        rule = session.query(ForwardRule).filter(ForwardRule.id == rule_id).first()
+        if rule:
+            session.expunge(rule)
+        return rule
+    except Exception as e:
+        logger.error(f"Error loading rule {rule_id}: {e}")
+        return None
+    finally:
+        session.close()
+
+def save_rule_to_db(rule):
+    """Save the provided rule object back to the database."""
+    if not Engine: return
+    session = Session()
+    try:
+        session.merge(rule) 
+        session.commit()
+    except Exception as e:
+        logger.error(f"Error saving rule to DB: {e}")
+    finally:
+        session.close()
 
 # 5. Utility Functions (Inline Keyboard and Text formatting)
 
-def get_current_settings_text(config):
-    """Returns a formatted string of current bot settings."""
-    status = "Shuru" if config.IS_FORWARDING_ACTIVE else "Ruka Hua"
-    links = "Haa" if config.BLOCK_LINKS else "Nahi"
-    usernames = "Haa" if config.BLOCK_USERNAMES else "Nahi"
+def is_admin(user_id):
+    """Checks if the user is the admin."""
+    return user_id == FORCE_ADMIN_ID
+
+def get_rule_settings_text(rule):
+    """Returns a formatted string of current rule settings."""
+    status = "Active" if rule.IS_ACTIVE else "Inactive"
+    mode_text = "Forward (Original)" if rule.FORWARDING_MODE == 'FORWARD' else "Copy (Full Control)"
+
+    # Existing & New Filters
+    links = "✅" if rule.BLOCK_LINKS else "❌"
+    usernames = "✅" if rule.BLOCK_USERNAMES else "❌"
+    media = "✅" if rule.BLOCK_MEDIA else "❌"
+    forwards = "✅" if rule.BLOCK_FORWARDS else "❌"
+    preview = "✅" if rule.REMOVE_WEB_PREVIEW else "❌"
     
-    # Get Mode Text
-    mode_text = "Forward (Original)" if config.FORWARDING_MODE == 'FORWARD' else "Copy (Caption Edit Possible)"
-
+    # New Features Status
+    rem_buttons = "✅" if rule.REMOVE_BUTTONS else "❌"
+    rem_caption = "✅" if rule.REMOVE_CAPTION else "❌"
+    silent = "✅" if rule.SILENT_FORWARDING else "❌"
+    block_service = "✅" if rule.BLOCK_SERVICE_MESSAGES else "❌"
+    block_replies = "✅" if rule.BLOCK_REPLIES else "❌"
+    
     replacements_list = "\n".join(
-        [f"   - '{f}' -> '{r}'" for f, r in (config.TEXT_REPLACEMENTS or {}).items()]
-    ) if (config.TEXT_REPLACEMENTS and len(config.TEXT_REPLACEMENTS) > 0) else "Koi Niyam Set Nahi"
+        [f"   - '{f}' -> '{r}'" for f, r in (rule.TEXT_REPLACEMENTS or {}).items()]
+    ) if (rule.TEXT_REPLACEMENTS and len(rule.TEXT_REPLACEMENTS) > 0) else "Koi Niyam Set Nahi"
 
-    blacklist_list = ", ".join(config.WORD_BLACKLIST or []) if (config.WORD_BLACKLIST and len(config.WORD_BLACKLIST) > 0) else "Koi Shabdh Block Nahi"
-    whitelist_list = ", ".join(config.WORD_WHITELIST or []) if (config.WORD_WHITELIST and len(config.WORD_WHITELIST) > 0) else "Koi Shabdh Jaruri Nahi"
+    blacklist_list = ", ".join(rule.WORD_BLACKLIST or []) if (rule.WORD_BLACKLIST and len(rule.WORD_BLACKLIST) > 0) else "Koi Shabdh Block Nahi"
+    whitelist_list = ", ".join(rule.WORD_WHITELIST or []) if (rule.WORD_WHITELIST and len(rule.WORD_WHITELIST) > 0) else "Koi Shabdh Jaruri Nahi"
 
     return (
-        f"**Bot Status:** `{status}`\n"
-        f"**Forwarding Mode:** `{mode_text}`\n\n"
-        f"**Source ID:** `{config.SOURCE_CHAT_ID or 'Set Nahi'}`\n"
-        f"**Destination ID:** `{config.DESTINATION_CHAT_ID or 'Set Nahi'}`\n\n"
-        f"**Filters:**\n"
+        f"**Rule Name:** `{rule.rule_name}`\n"
+        f"**Rule ID:** `{rule.id}`\n"
+        f"**Status:** `{status}`\n"
+        f"**Mode:** `{mode_text}`\n\n"
+        f"**Source ID:** `{rule.SOURCE_CHAT_ID or 'Set Nahi'}`\n"
+        f"**Destination ID:** `{rule.DESTINATION_CHAT_ID or 'Set Nahi'}`\n\n"
+        f"**Filters & Actions:**\n"
+        f" - Delay: `{rule.FORWARD_DELAY_SECONDS}s`\n"
         f" - Links Block: `{links}`\n"
         f" - Usernames Block: `{usernames}`\n"
-        f" - Forwarding Delay: `{config.FORWARD_DELAY_SECONDS} seconds`\n"
-        f" - **Blacklist Words:** `{blacklist_list}`\n"
-        f" - **Whitelist Words:** `{whitelist_list}`\n\n"
+        f" - Media Block: `{media}`\n"
+        f" - Forwards Block: `{forwards}`\n"
+        f" - Web Preview Remove: `{preview}`\n"
+        f" - **Remove Buttons:** `{rem_buttons}`\n"
+        f" - **Remove Caption:** `{rem_caption}`\n"
+        f" - **Silent Forward:** `{silent}`\n"
+        f" - **Block Service Msgs:** `{block_service}`\n"
+        f" - **Block Replies:** `{block_replies}`\n\n"
+        f"**Prefix/Suffix:**\n"
+        f" - Prefix: `{rule.PREFIX_TEXT[:30] + '...' if rule.PREFIX_TEXT else 'Nahi'}`\n"
+        f" - Suffix: `{rule.SUFFIX_TEXT[:30] + '...' if rule.SUFFIX_TEXT else 'Nahi'}`\n\n"
+        f"**Word Lists:**\n"
+        f" - Blacklist: `{blacklist_list}`\n"
+        f" - Whitelist: `{whitelist_list}`\n\n"
         f"**Text Replacement Rules:**\n{replacements_list}"
     )
 
-def create_main_menu_keyboard(config):
-    """Creates the main inline keyboard menu."""
+def create_rule_list_keyboard(rules):
+    """Creates the keyboard for selecting and managing rules."""
+    keyboard = []
+    for rule in rules:
+        keyboard.append([
+            InlineKeyboardButton(f"⚙️ {rule.rule_name} (ID: {rule.id})", callback_data=f'select_rule_{rule.id}')
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Naya Rule Jodein", callback_data='create_new_rule')])
+    keyboard.append([InlineKeyboardButton("💬 Message Mein Button Jodein", callback_data='add_button_menu')]) # New Button Feature
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def create_rule_settings_keyboard(rule):
+    """Creates the main inline keyboard menu for a specific rule."""
+    rule_id = rule.id
     keyboard = [
         [
-            InlineKeyboardButton("➡️ Source Set Karein", callback_data='set_source'),
-            InlineKeyboardButton("🎯 Destination Set Karein", callback_data='set_destination')
+            InlineKeyboardButton("➡️ Source/Destination Set Karein", callback_data=f'menu_core_{rule_id}'),
+            InlineKeyboardButton("📝 Text Niyam (Replacements/Lists)", callback_data=f'menu_text_{rule_id}')
         ],
         [
-            InlineKeyboardButton(f"🔗 Links Block ({'✅' if config.BLOCK_LINKS else '❌'})", callback_data='toggle_block_links'),
-            InlineKeyboardButton(f"👤 Usernames Block ({'✅' if config.BLOCK_USERNAMES else '❌'})", callback_data='toggle_block_usernames')
+            InlineKeyboardButton(f"📨 Mode: {'COPY' if rule.FORWARDING_MODE == 'COPY' else 'FORWARD'} & Delay", callback_data=f'menu_mode_delay_{rule_id}')
         ],
         [
-            InlineKeyboardButton("📝 Text Badalna (Replacement)", callback_data='menu_replacement'),
-            InlineKeyboardButton(f"⏰ Schedule ({config.FORWARD_DELAY_SECONDS}s)", callback_data='menu_schedule')
+            InlineKeyboardButton(f"🔗 Links Block ({'✅' if rule.BLOCK_LINKS else '❌'})", callback_data=f'toggle_block_links_{rule_id}'),
+            InlineKeyboardButton(f"👤 Usernames Block ({'✅' if rule.BLOCK_USERNAMES else '❌'})", callback_data=f'toggle_block_usernames_{rule_id}')
         ],
         [
-            InlineKeyboardButton("⛔️ Blacklist Manage Karein", callback_data='menu_blacklist'),
-            InlineKeyboardButton("✅ Whitelist Manage Karein", callback_data='menu_whitelist')
+            InlineKeyboardButton(f"🖼️ Media/Forward Filters", callback_data=f'menu_media_filters_{rule_id}'),
+            InlineKeyboardButton(f"🛠️ Caption/Reply/Silent Actions", callback_data=f'menu_advanced_actions_{rule_id}')
         ],
         [
-            # New button for Forwarding Mode
-            InlineKeyboardButton(f"📨 Mode: {'COPY' if config.FORWARDING_MODE == 'COPY' else 'FORWARD'}", callback_data='menu_forwarding_mode'),
-            InlineKeyboardButton("🔄 Bot Settings Refresh", callback_data='refresh_config')
+            InlineKeyboardButton("⏸️ Rokein" if rule.IS_ACTIVE else "▶️ Shuru Karein", callback_data=f'toggle_active_{rule_id}'),
+            InlineKeyboardButton("🗑️ Rule Delete Karein", callback_data=f'delete_rule_{rule_id}')
         ],
         [
-            InlineKeyboardButton("⏸️ Rokein" if config.IS_FORWARDING_ACTIVE else "▶️ Shuru Karein", callback_data='toggle_forwarding'),
-            InlineKeyboardButton("⚙️ Current Settings Dekhein", callback_data='show_settings'),
-        ],
-        [
-            # Button to help copy destination messages (as requested)
-            InlineKeyboardButton("📋 Destination Message Copy Karein", url=f"https://t.me/share/url?url=t.me/{config.DESTINATION_CHAT_ID}"),
+            InlineKeyboardButton("⬅️ Rule List Par Wapas Jaane", callback_data='main_menu')
         ]
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_core_settings_keyboard(rule_id):
+    """Core settings: Source/Destination."""
+    keyboard = [
+        [
+            InlineKeyboardButton("➡️ Source Set Karein", callback_data=f'set_source_{rule_id}'),
+            InlineKeyboardButton("🎯 Destination Set Karein", callback_data=f'set_destination_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton("⬅️ Rule Settings", callback_data=f'select_rule_{rule_id}')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_media_filters_keyboard(rule):
+    """New dedicated menu for media-related filters."""
+    rule_id = rule.id
+    keyboard = [
+        [
+            InlineKeyboardButton(f"🖼️ Media Block ({'✅' if rule.BLOCK_MEDIA else '❌'})", callback_data=f'toggle_block_media_{rule_id}'),
+            InlineKeyboardButton(f"↪️ Forwards Block ({'✅' if rule.BLOCK_FORWARDS else '❌'})", callback_data=f'toggle_block_forwards_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton(f"🗑️ Remove Buttons ({'✅' if rule.REMOVE_BUTTONS else '❌'})", callback_data=f'toggle_remove_buttons_{rule_id}'),
+            InlineKeyboardButton(f"🗑️ Remove Caption ({'✅' if rule.REMOVE_CAPTION else '❌'})", callback_data=f'toggle_remove_caption_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton("⬅️ Rule Settings", callback_data=f'select_rule_{rule_id}')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_advanced_actions_keyboard(rule):
+    """New dedicated menu for advanced actions."""
+    rule_id = rule.id
+    keyboard = [
+        [
+            InlineKeyboardButton(f"🔇 Silent Forward ({'✅' if rule.SILENT_FORWARDING else '❌'})", callback_data=f'toggle_silent_forwarding_{rule_id}'),
+            InlineKeyboardButton(f"⛔️ Block Service Msgs ({'✅' if rule.BLOCK_SERVICE_MESSAGES else '❌'})", callback_data=f'toggle_block_service_messages_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton(f"❌ Block Replies ({'✅' if rule.BLOCK_REPLIES else '❌'})", callback_data=f'toggle_block_replies_{rule_id}'),
+            InlineKeyboardButton(f"📝 Prefix/Suffix Text", callback_data=f'menu_prefix_suffix_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton("⬅️ Rule Settings", callback_data=f'select_rule_{rule_id}')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_text_menu_keyboard(rule_id):
+    """Menu for Text processing: Replacement, Blacklist, Whitelist."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Text Replacement Manage Karein", callback_data=f'menu_replacement_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton("⛔️ Blacklist Manage Karein", callback_data=f'menu_blacklist_{rule_id}'),
+            InlineKeyboardButton("✅ Whitelist Manage Karein", callback_data=f'menu_whitelist_{rule_id}')
+        ],
+        [
+            InlineKeyboardButton("⬅️ Rule Settings", callback_data=f'select_rule_{rule_id}')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_replacement_menu_keyboard(rule_id):
+    """Menu for Text Replacement: Add, Delete All, Delete Individual."""
+    keyboard = [
+        [InlineKeyboardButton("➕ Naya Niyam Jodein", callback_data=f'add_replacement_find_{rule_id}')], 
+        [
+            InlineKeyboardButton("🗑️ Saare Niyam Hatayein", callback_data=f'clear_replacements_{rule_id}'), 
+            InlineKeyboardButton("❌ Niyam Hatayein (Individual)", callback_data=f'delete_replacement_select_{rule_id}') # New Individual Delete
+        ], 
+        [InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_text_{rule_id}')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_individual_delete_keyboard(replacements, rule_id):
+    """Keyboard to select individual replacements for deletion."""
+    keyboard = []
+    for find_text, _ in replacements.items():
+        # Use a short version for button text
+        display_text = find_text[:20] + '...' if len(find_text) > 20 else find_text
+        # Note: We must encode/decode the find_text if it is passed in callback_data due to character limits and safety. 
+        # For simplicity and to avoid complexity, we rely on the button text being short enough here.
+        keyboard.append([InlineKeyboardButton(display_text, callback_data=f'delete_replacement_confirm_{rule_id}_{find_text}')])
+    
+    keyboard.append([InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_replacement_{rule_id}')])
     return InlineKeyboardMarkup(keyboard)
 
 def create_back_keyboard(callback_data='main_menu'):
@@ -199,27 +341,18 @@ def create_back_keyboard(callback_data='main_menu'):
 # 6. Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles the /start command and sets the admin user."""
-    global GLOBAL_CONFIG
     user_id = update.effective_user.id
-    
-    # Reload config to ensure we have the latest state on every /start
-    GLOBAL_CONFIG = load_config_from_db()
+    if not is_admin(user_id):
+        await update.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
+        return ConversationHandler.END
 
-    # FORCE ADMIN ID: Agar FORCE_ADMIN_ID set hai, to use hi use karein
-    if FORCE_ADMIN_ID and GLOBAL_CONFIG.ADMIN_USER_ID != FORCE_ADMIN_ID:
-        GLOBAL_CONFIG.ADMIN_USER_ID = FORCE_ADMIN_ID
-        save_config_to_db(GLOBAL_CONFIG)
-        logger.info(f"Admin User ID forcibly set to: {FORCE_ADMIN_ID}")
-    
-    elif GLOBAL_CONFIG.ADMIN_USER_ID is None:
-        GLOBAL_CONFIG.ADMIN_USER_ID = user_id
-        save_config_to_db(GLOBAL_CONFIG)
-        logger.info(f"Admin User ID set to: {user_id}")
+    rules = get_all_rules()
     
     await update.message.reply_text(
-        f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
-        f"**Current Settings:**\n{get_current_settings_text(GLOBAL_CONFIG)}",
-        reply_markup=create_main_menu_keyboard(GLOBAL_CONFIG),
+        f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n"
+        f"Ab aap **Multiple Rules** manage kar sakte hain.\n\n"
+        f"**Kul Rules:** {len(rules)}",
+        reply_markup=create_rule_list_keyboard(rules),
         parse_mode='Markdown'
     )
     return ConversationHandler.END
@@ -227,179 +360,334 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # 7. Callback Handlers (For Inline Buttons)
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles all Inline Button presses and transitions conversations."""
-    global GLOBAL_CONFIG
     query = update.callback_query
     await query.answer()
     data = query.data
     chat_id = query.message.chat_id
 
     # Admin Check (Ensures only admin can change settings)
-    # Check if chat_id matches saved Admin ID OR the forced Admin ID
-    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and chat_id != FORCE_ADMIN_ID:
+    if not is_admin(chat_id):
         await query.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
         return
 
-    GLOBAL_CONFIG = load_config_from_db() # Ensure latest config before making changes
-
-    # --- Navigation and Simple Toggles ---
+    # --- Rule List Navigation ---
     if data == 'main_menu':
+        rules = get_all_rules()
         await query.edit_message_text(
-            f"**Mukhya Menu (Main Menu)**\n\n{get_current_settings_text(GLOBAL_CONFIG)}",
-            reply_markup=create_main_menu_keyboard(GLOBAL_CONFIG),
-            parse_mode='Markdown'
-        )
-        return ConversationHandler.END
-
-    elif data == 'toggle_block_links':
-        GLOBAL_CONFIG.BLOCK_LINKS = not GLOBAL_CONFIG.BLOCK_LINKS
-    elif data == 'toggle_block_usernames':
-        GLOBAL_CONFIG.BLOCK_USERNAMES = not GLOBAL_CONFIG.BLOCK_USERNAMES
-    elif data == 'toggle_forwarding':
-        GLOBAL_CONFIG.IS_FORWARDING_ACTIVE = not GLOBAL_CONFIG.IS_FORWARDING_ACTIVE
-    elif data == 'refresh_config':
-        # Reloads config from DB, simulating a fresh start without data loss
-        msg = f"**Bot Settings Refresh** safaltapoorvak ho gaya hai. Settings Database se **Reload** ho gayi hain."
-        save_config_to_db(GLOBAL_CONFIG) # Ensure the current state is saved before confirmation
-        await query.edit_message_text(msg + f"\n\nCurrent Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}", reply_markup=create_back_keyboard(), parse_mode='Markdown')
-        return ConversationHandler.END
-
-    if data in ['toggle_block_links', 'toggle_block_usernames', 'toggle_forwarding']:
-        save_config_to_db(GLOBAL_CONFIG)
-        await query.edit_message_text(
-            f"**Setting Updated**\n\n"
-            f"Current Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}",
-            reply_markup=create_back_keyboard(),
+            f"**Rule List**\n\nKul Rules: {len(rules)}",
+            reply_markup=create_rule_list_keyboard(rules),
             parse_mode='Markdown'
         )
         return ConversationHandler.END
         
-    # --- Conversation Starters ---
-    elif data == 'set_source':
-        await query.edit_message_text("Kripya Source Channel ka **ID** ya **Username** bhejein.", reply_markup=create_back_keyboard())
-        return SET_SOURCE
+    elif data.startswith('select_rule_'):
+        rule_id = int(data.split('_')[2])
+        rule = get_rule_by_id(rule_id)
+        if not rule:
+            await query.edit_message_text("❌ Rule nahi mila!", reply_markup=create_back_keyboard())
+            return ConversationHandler.END
+            
+        context.user_data['current_rule_id'] = rule_id
+        await query.edit_message_text(
+            f"**Rule Settings**\n\n{get_rule_settings_text(rule)}",
+            reply_markup=create_rule_settings_keyboard(rule),
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
     
-    elif data == 'set_destination':
-        await query.edit_message_text("Kripya Destination Channel ka **ID** ya **Username** bhejein.", reply_markup=create_back_keyboard())
-        return SET_DESTINATION
+    elif data == 'create_new_rule':
+        await query.edit_message_text("Kripya naye rule ka **Naam** (Jaise: `Cricket_to_News`) bhejein.", reply_markup=create_back_keyboard())
+        return SET_RULE_NAME
+        
+    elif data.startswith('delete_rule_'):
+        rule_id = int(data.split('_')[2])
+        session = Session()
+        try:
+            rule = session.query(ForwardRule).filter(ForwardRule.id == rule_id).first()
+            if rule:
+                session.delete(rule)
+                session.commit()
+                await query.edit_message_text(f"✅ Rule **{rule.rule_name}** safaltapoorvak **Delete** kar diya gaya hai.", reply_markup=create_back_keyboard())
+            else:
+                await query.edit_message_text("❌ Rule nahi mila.", reply_markup=create_back_keyboard())
+        except Exception as e:
+            await query.edit_message_text(f"❌ Rule delete karte samay error hua: {e}", reply_markup=create_back_keyboard())
+        finally:
+            session.close()
+        return ConversationHandler.END
 
-    # --- Nested Menus ---
-    elif data == 'menu_schedule':
+    # --- Button Add Feature Start ---
+    elif data == 'add_button_menu':
+        await query.edit_message_text(
+            "Kripya Target Channel ID aur Message ID is format mein bhejein (Example: `-1001234567890:54321`)",
+            reply_markup=create_back_keyboard()
+        )
+        return SET_MESSAGE_FOR_BUTTONS
+
+    # --- Rule Specific Menus ---
+    elif data.startswith('menu_'):
+        parts = data.split('_')
+        menu_type = parts[1]
+        rule_id = int(parts[-1])
+        rule = get_rule_by_id(rule_id)
+
+        if menu_type == 'core':
+            await query.edit_message_text("Source aur Destination settings.", reply_markup=create_core_settings_keyboard(rule_id))
+        elif menu_type == 'text':
+            await query.edit_message_text("Text Filters, Lists, aur Replacement settings.", reply_markup=create_text_menu_keyboard(rule_id))
+        elif menu_type == 'replacement':
+            await query.edit_message_text("Text Replacement Niyam.", reply_markup=create_replacement_menu_keyboard(rule_id))
+        elif menu_type == 'media':
+            await query.edit_message_text("Media/Forward related filters.", reply_markup=create_media_filters_keyboard(rule))
+        elif menu_type == 'advanced':
+            await query.edit_message_text("Advanced actions (Caption, Silent, Prefix/Suffix).", reply_markup=create_advanced_actions_keyboard(rule))
+        elif menu_type == 'prefix':
+            keyboard = [[InlineKeyboardButton("📝 Prefix Set Karein", callback_data=f'set_prefix_{rule_id}')], [InlineKeyboardButton("📝 Suffix Set Karein", callback_data=f'set_suffix_{rule_id}')], [InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_advanced_actions_{rule_id}')]]
+            await query.edit_message_text("Message mein shuru aur ant mein text jodien.", reply_markup=InlineKeyboardMarkup(keyboard))
+        elif menu_type == 'mode':
+             keyboard = [
+                [InlineKeyboardButton(f"1. Forward (Original) {'✅' if rule.FORWARDING_MODE == 'FORWARD' else '❌'}", callback_data=f'set_mode_forward_{rule_id}')],
+                [InlineKeyboardButton(f"2. Copy (Full Control) {'✅' if rule.FORWARDING_MODE == 'COPY' else '❌'}", callback_data=f'set_mode_copy_{rule_id}')],
+                [InlineKeyboardButton(f"⏰ Delay Set Karein ({rule.FORWARD_DELAY_SECONDS}s)", callback_data=f'menu_schedule_{rule_id}')],
+                [InlineKeyboardButton("⬅️ Rule Settings", callback_data=f'select_rule_{rule_id}')]
+            ]
+             await query.edit_message_text("Message Forwarding ka **Mode** chunein. COPY mode hi zyadatar features (Replacement, Button Remove) ko support karta hai.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        return ConversationHandler.END
+
+    # --- Rule Specific Toggles and Actions ---
+    elif any(data.startswith(f) for f in ['toggle_', 'set_']):
+        parts = data.split('_')
+        action = parts[0]
+        setting = parts[1]
+        rule_id = int(parts[-1])
+        rule = get_rule_by_id(rule_id)
+        
+        if not rule:
+            await query.edit_message_text("❌ Rule nahi mila!", reply_markup=create_back_keyboard())
+            return ConversationHandler.END
+
+        if action == 'toggle':
+            attr = f"{setting.upper()}_{'_'.join(parts[2:-1]).upper()}" if len(parts) > 3 else setting.upper()
+            
+            # Special case for IS_ACTIVE
+            if setting == 'active':
+                setattr(rule, 'IS_ACTIVE', not rule.IS_ACTIVE)
+            # Other Boolean Toggles (BLOCK_LINKS, REMOVE_BUTTONS, etc.)
+            elif hasattr(rule, attr):
+                 current_value = getattr(rule, attr)
+                 setattr(rule, attr, not current_value)
+
+            save_rule_to_db(rule)
+            await query.edit_message_text(
+                f"✅ **{attr.replace('_', ' ').title()}** updated.\n\n"
+                f"Current Settings:\n{get_rule_settings_text(rule)}",
+                reply_markup=create_back_keyboard(f'select_rule_{rule_id}'),
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+            
+        elif action == 'set':
+            if setting in ['source', 'destination']:
+                context.user_data['current_rule_id'] = rule_id
+                state = SET_SOURCE_ID if setting == 'source' else SET_DESTINATION_ID
+                await query.edit_message_text(f"Kripya Rule **{rule.rule_name}** ke liye {setting.title()} Channel ka **ID** ya **Username** bhejein.", reply_markup=create_back_keyboard(f'menu_core_{rule_id}'))
+                return state
+                
+            elif setting in ['prefix', 'suffix']:
+                 context.user_data['current_rule_id'] = rule_id
+                 context.user_data['prefix_or_suffix'] = setting.upper()
+                 state = SET_PREFIX_TEXT if setting == 'prefix' else SET_SUFFIX_TEXT
+                 await query.edit_message_text(f"Kripya Rule **{rule.rule_name}** ke liye **{setting.title()}** text bhejein (ya `clear` likhein hatane ke liye).", reply_markup=create_back_keyboard(f'menu_advanced_actions_{rule_id}'))
+                 return state
+
+            elif setting == 'mode':
+                mode = parts[2].upper()
+                rule.FORWARDING_MODE = mode
+                save_rule_to_db(rule)
+                await query.edit_message_text(
+                    f"✅ **Forwarding Mode** ab `{mode}` set kar diya gaya hai.\n\n"
+                    f"Current Settings:\n{get_rule_settings_text(rule)}",
+                    reply_markup=create_back_keyboard(f'select_rule_{rule_id}'),
+                    parse_mode='Markdown'
+                )
+                return ConversationHandler.END
+            
+    # --- Nested Menus: Schedule ---
+    elif data.startswith('menu_schedule_'):
+        rule_id = int(data.split('_')[2])
         keyboard = [
-            [InlineKeyboardButton("0 Sec (Default)", callback_data='set_delay_0'), InlineKeyboardButton("5 Sec", callback_data='set_delay_5')],
-            [InlineKeyboardButton("15 Sec", callback_data='set_delay_15'), InlineKeyboardButton("30 Sec", callback_data='set_delay_30')],
-            [InlineKeyboardButton("60 Sec (1 Minute)", callback_data='set_delay_60')],
-            [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]
+            [InlineKeyboardButton("0 Sec (Default)", callback_data=f'set_delay_0_{rule_id}'), InlineKeyboardButton("5 Sec", callback_data=f'set_delay_5_{rule_id}')],
+            [InlineKeyboardButton("15 Sec", callback_data=f'set_delay_15_{rule_id}'), InlineKeyboardButton("30 Sec", callback_data=f'set_delay_30_{rule_id}')],
+            [InlineKeyboardButton("60 Sec (1 Minute)", callback_data=f'set_delay_60_{rule_id}')],
+            [InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_mode_delay_{rule_id}')]
         ]
         await query.edit_message_text("Message Forward hone se pehle kitna **Delay** chahiye?", reply_markup=InlineKeyboardMarkup(keyboard))
         return ConversationHandler.END
         
     elif data.startswith('set_delay_'):
-        delay = int(data.split('_')[2])
-        GLOBAL_CONFIG.FORWARD_DELAY_SECONDS = delay
-        save_config_to_db(GLOBAL_CONFIG)
+        parts = data.split('_')
+        delay = int(parts[2])
+        rule_id = int(parts[3])
+        rule = get_rule_by_id(rule_id)
+        rule.FORWARD_DELAY_SECONDS = delay
+        save_rule_to_db(rule)
         await query.edit_message_text(
-            f"**Forwarding Delay:** Ab `{delay} seconds` set kar diya gaya hai.\n\n"
-            f"Current Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}",
-            reply_markup=create_back_keyboard(),
+            f"✅ **Rule {rule.rule_name}** ka Delay ab `{delay} seconds` set kar diya gaya hai.",
+            reply_markup=create_back_keyboard(f'select_rule_{rule_id}'),
             parse_mode='Markdown'
         )
         return ConversationHandler.END
-
-    # --- NEW: Forwarding Mode Menu ---
-    elif data == 'menu_forwarding_mode':
-        keyboard = [
-            [InlineKeyboardButton(f"1. Forward (Original) {'✅' if GLOBAL_CONFIG.FORWARDING_MODE == 'FORWARD' else '❌'}", callback_data='set_mode_forward')],
-            [InlineKeyboardButton(f"2. Copy (Caption Editing) {'✅' if GLOBAL_CONFIG.FORWARDING_MODE == 'COPY' else '❌'}", callback_data='set_mode_copy')],
-            [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]
-        ]
-        await query.edit_message_text("Message Forwarding ka **Mode** chunein:\n\n*1. Forward*: Message ka format original rehta hai. Yeh tabhi Copy hota hai jab Text Replacement kiya jata hai.\n*2. Copy*: Hamesha Copy hoga, jisse aapka Text Replacement niyam hamesha lagu ho aur original caption bhi hataya ja sake.", reply_markup=InlineKeyboardMarkup(keyboard))
-        return ConversationHandler.END
-
-    elif data.startswith('set_mode_'):
-        mode = data.split('_')[2].upper()
-        GLOBAL_CONFIG.FORWARDING_MODE = mode
-        save_config_to_db(GLOBAL_CONFIG)
-        await query.edit_message_text(
-            f"**Forwarding Mode** ab `{mode}` set kar diya gaya hai.\n\n"
-            f"Current Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}",
-            reply_markup=create_back_keyboard(),
-            parse_mode='Markdown'
-        )
-        return ConversationHandler.END
-    # --- END NEW: Forwarding Mode Menu ---
-
-
-    # --- Blacklist/Whitelist/Replacement Menus (Similar structure to be handled in conversation) ---
-    elif data == 'menu_blacklist':
-        keyboard = [[InlineKeyboardButton("➕ Shabdh Blacklist Karein", callback_data='add_blacklist_word')], [InlineKeyboardButton("🗑️ Saare Blacklist Hatayein", callback_data='clear_blacklist')], [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]]
-        await query.edit_message_text(f"**Word Blacklist Settings**\n\nCurrent Blacklisted Words: {', '.join(GLOBAL_CONFIG.WORD_BLACKLIST or []) or 'Koi nahi'}", reply_markup=InlineKeyboardMarkup(keyboard))
-        return ConversationHandler.END
         
-    elif data == 'add_blacklist_word':
-        await query.edit_message_text("Kripya vah **Shabdh** bhejein jise aap **Block** karna chahte hain.", reply_markup=create_back_keyboard('menu_blacklist'))
-        return SET_BLACKLIST_WORD
-
-    elif data == 'clear_blacklist':
-        GLOBAL_CONFIG.WORD_BLACKLIST = []
-        save_config_to_db(GLOBAL_CONFIG)
-        await query.edit_message_text("**Saare Blacklisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard())
-        return ConversationHandler.END
-        
-    # Whitelist Menu (Only for clarity, handlers are similar to blacklist/replacement)
-    elif data == 'menu_whitelist':
-        keyboard = [[InlineKeyboardButton("➕ Shabdh Whitelist Karein", callback_data='add_whitelist_word')], [InlineKeyboardButton("🗑️ Saare Whitelist Hatayein", callback_data='clear_whitelist')], [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]]
-        await query.edit_message_text(f"**Word Whitelist Settings**\n\nCurrent Whitelisted Words: {', '.join(GLOBAL_CONFIG.WORD_WHITELIST or []) or 'Koi nahi'} (Inka hona jaruri hai)", reply_markup=InlineKeyboardMarkup(keyboard))
-        return ConversationHandler.END
-
-    elif data == 'add_whitelist_word':
-        await query.edit_message_text("Kripya vah **Shabdh** bhejein jiska Message mein **Hona Jaruri** hai.", reply_markup=create_back_keyboard('menu_whitelist'))
-        return SET_WHITELIST_WORD
-
-    elif data == 'clear_whitelist':
-        GLOBAL_CONFIG.WORD_WHITELIST = []
-        save_config_to_db(GLOBAL_CONFIG)
-        await query.edit_message_text("**Saare Whitelisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard())
-        return ConversationHandler.END
-        
-    elif data == 'menu_replacement':
-        keyboard = [[InlineKeyboardButton("➕ Naya Niyam Jodein", callback_data='add_replacement_find')], [InlineKeyboardButton("🗑️ Saare Niyam Hatayein", callback_data='clear_replacements')], [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]]
-        await query.edit_message_text(f"**Text Replacement Niyam**\n\n{get_current_settings_text(GLOBAL_CONFIG)}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return ConversationHandler.END
-
-    elif data == 'add_replacement_find':
-        await query.edit_message_text("Vah **Text Bhejein** jise aap Message mein **Dhoondhna** chahte hain (Find Text).", reply_markup=create_back_keyboard('menu_replacement'))
+    # --- Text Replacement Management ---
+    elif data.startswith('add_replacement_find_'):
+        rule_id = int(data.split('_')[-1])
+        context.user_data['current_rule_id'] = rule_id
+        await query.edit_message_text("Vah **Text Bhejein** jise aap Message mein **Dhoondhna** chahte hain (Find Text).", reply_markup=create_back_keyboard(f'menu_replacement_{rule_id}'))
         return SET_REPLACEMENT_FIND
     
-    elif data == 'clear_replacements':
-        GLOBAL_CONFIG.TEXT_REPLACEMENTS = {}
-        save_config_to_db(GLOBAL_CONFIG)
-        await query.edit_message_text("**Saare Text Replacement Niyam** hata diye gaye hain.", reply_markup=create_back_keyboard())
+    elif data.startswith('clear_replacements_'):
+        rule_id = int(data.split('_')[-1])
+        rule = get_rule_by_id(rule_id)
+        rule.TEXT_REPLACEMENTS = {}
+        save_rule_to_db(rule)
+        await query.edit_message_text(f"✅ Rule **{rule.rule_name}** ke **Saare Text Replacement Niyam** hata diye gaye hain.", reply_markup=create_back_keyboard(f'select_rule_{rule_id}'))
         return ConversationHandler.END
 
-    return ConversationHandler.END # End the conversation if the callback is handled
+    # New: Individual Replacement Deletion Flow
+    elif data.startswith('delete_replacement_select_'):
+        rule_id = int(data.split('_')[-1])
+        rule = get_rule_by_id(rule_id)
+        if not rule.TEXT_REPLACEMENTS:
+            await query.edit_message_text("❌ Is Rule mein koi Replacement Niyam nahi hai.", reply_markup=create_back_keyboard(f'menu_replacement_{rule_id}'))
+            return ConversationHandler.END
+        
+        await query.edit_message_text("Kripya **Vah Niyam Chunein** jise aap hatana chahte hain:", reply_markup=create_individual_delete_keyboard(rule.TEXT_REPLACEMENTS, rule_id))
+        return ConversationHandler.END
+
+    elif data.startswith('delete_replacement_confirm_'):
+        # Data format: delete_replacement_confirm_{rule_id}_{find_text}
+        parts = data.split('_')
+        rule_id = int(parts[3])
+        # Reconstruct the find_text from the rest of the parts
+        # This is a dangerous operation due to callback_data limits and potential encoding issues
+        find_text = '_'.join(parts[4:])
+        
+        rule = get_rule_by_id(rule_id)
+        
+        if find_text in rule.TEXT_REPLACEMENTS:
+            del rule.TEXT_REPLACEMENTS[find_text]
+            save_rule_to_db(rule)
+            await query.edit_message_text(f"✅ Replacement Niyam: **'{find_text[:20]}...'** hata diya gaya hai.", reply_markup=create_back_keyboard(f'menu_replacement_{rule_id}'))
+        else:
+            await query.edit_message_text("❌ Vah Niyam nahi mila.", reply_markup=create_back_keyboard(f'menu_replacement_{rule_id}'))
+
+        return ConversationHandler.END
+        
+    # --- Blacklist/Whitelist Management ---
+    elif data.startswith('menu_blacklist_') or data.startswith('menu_whitelist_'):
+        is_blacklist = data.startswith('menu_blacklist_')
+        rule_id = int(data.split('_')[-1])
+        rule = get_rule_by_id(rule_id)
+        list_name = "Blacklist" if is_blacklist else "Whitelist"
+        current_list = rule.WORD_BLACKLIST if is_blacklist else rule.WORD_WHITELIST
+        
+        keyboard = [
+            [InlineKeyboardButton(f"➕ Shabdh {list_name} Karein", callback_data=f'add_{list_name.lower()}_word_{rule_id}')], 
+            [InlineKeyboardButton(f"🗑️ Saare {list_name} Hatayein", callback_data=f'clear_{list_name.lower()}_{rule_id}')], 
+            [InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_text_{rule_id}')]
+        ]
+        
+        await query.edit_message_text(
+            f"**Word {list_name} Settings (Rule {rule.rule_name})**\n\n"
+            f"Current {list_name} Words: {', '.join(current_list or []) or 'Koi nahi'}", 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
+        
+    elif data.startswith('add_blacklist_word_') or data.startswith('add_whitelist_word_'):
+        rule_id = int(data.split('_')[-1])
+        list_type = data.split('_')[1]
+        list_name = "Blacklist" if list_type == 'blacklist' else "Whitelist"
+        
+        context.user_data['current_rule_id'] = rule_id
+        context.user_data['list_type'] = list_type
+        
+        state = SET_BLACKLIST_WORD if list_type == 'blacklist' else SET_WHITELIST_WORD
+        await query.edit_message_text(
+            f"Kripya vah **Shabdh** bhejein jise aap **{list_name}** karna chahte hain.", 
+            reply_markup=create_back_keyboard(f'menu_{list_type}_{rule_id}')
+        )
+        return state
+
+    elif data.startswith('clear_blacklist_') or data.startswith('clear_whitelist_'):
+        rule_id = int(data.split('_')[-1])
+        list_type = data.split('_')[1]
+        rule = get_rule_by_id(rule_id)
+        
+        if list_type == 'blacklist':
+            rule.WORD_BLACKLIST = []
+        else:
+            rule.WORD_WHITELIST = []
+            
+        save_rule_to_db(rule)
+        list_name = "Blacklisted" if list_type == 'blacklist' else "Whitelisted"
+        await query.edit_message_text(f"✅ Rule **{rule.rule_name}** ke **Saare {list_name} Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'menu_text_{rule_id}'))
+        return ConversationHandler.END
+        
+    return ConversationHandler.END
 
 # 8. Conversation Handlers (For User Input)
 
+async def set_rule_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Creates a new rule and returns to rule settings."""
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
+    
+    rule_name = update.message.text.strip()
+    if not rule_name:
+        await update.message.reply_text("Rule ka naam khaali nahi ho sakta.", reply_markup=create_back_keyboard())
+        return SET_RULE_NAME
+        
+    session = Session()
+    try:
+        new_rule = ForwardRule(rule_name=rule_name)
+        session.add(new_rule)
+        session.commit()
+        session.expunge(new_rule)
+        
+        await update.message.reply_text(
+            f"✅ Naya Rule **'{rule_name}'** safaltapoorvak bana diya gaya hai.",
+            reply_markup=create_back_keyboard(f'select_rule_{new_rule.id}'),
+            parse_mode='Markdown'
+        )
+        context.user_data['current_rule_id'] = new_rule.id
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: Rule nahi bana paya. Shayad yeh naam pehle se hi hai. ({e})", reply_markup=create_back_keyboard())
+        session.close()
+        return SET_RULE_NAME
+        
 async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, config_attr: str) -> int:
     """Utility function to handle receiving chat ID/Username."""
-    global GLOBAL_CONFIG
-    # Check against saved Admin ID AND forced Admin ID
-    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
-        await update.message.reply_text("Aap Bot ke Admin nahi hain.")
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
+    
+    rule_id = context.user_data.pop('current_rule_id')
+    rule = get_rule_by_id(rule_id)
+    if not rule:
+        await update.message.reply_text("❌ Rule nahi mila.", reply_markup=create_back_keyboard())
         return ConversationHandler.END
 
     chat_input = update.message.text.strip()
     if not (chat_input.startswith('-100') or chat_input.startswith('@') or chat_input.isdigit()):
-         await update.message.reply_text("Galat format! Kripya ID (-100...) ya Username (@...) bhejein.", reply_markup=create_back_keyboard('main_menu'))
+         await update.message.reply_text("❌ Galat format! Kripya ID (-100...) ya Username (@...) bhejein.", reply_markup=create_back_keyboard(f'menu_core_{rule_id}'))
          return ConversationHandler.END
 
-    setattr(GLOBAL_CONFIG, config_attr, chat_input)
-    save_config_to_db(GLOBAL_CONFIG)
+    setattr(rule, config_attr, chat_input)
+    save_rule_to_db(rule)
     
     await update.message.reply_text(
-        f"**{config_attr.replace('_', ' ')}** safaltapoorvak `{chat_input}` set kar diya gaya hai.\n\n"
-        f"Current Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}",
-        reply_markup=create_back_keyboard(),
+        f"✅ Rule **{rule.rule_name}** ka **{config_attr.replace('_', ' ')}** safaltapoorvak `{chat_input}` set kar diya gaya hai.",
+        reply_markup=create_back_keyboard(f'select_rule_{rule_id}'),
         parse_mode='Markdown'
     )
     return ConversationHandler.END
@@ -410,173 +698,340 @@ async def set_source_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def set_destination_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await handle_chat_id_input(update, context, "DESTINATION_CHAT_ID")
 
-async def set_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE, list_name: str, callback_menu: str) -> int:
+async def set_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE, list_name: str, state_to_return: int) -> int:
     """Adds a word to Blacklist or Whitelist."""
-    global GLOBAL_CONFIG
-    # Check against saved Admin ID AND forced Admin ID
-    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
-        await update.message.reply_text("Aap Bot ke Admin nahi hain.")
-        return ConversationHandler.END
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
     
+    rule_id = context.user_data.pop('current_rule_id')
+    list_type = context.user_data.pop('list_type')
+    rule = get_rule_by_id(rule_id)
+    if not rule: return ConversationHandler.END
+
     word = update.message.text.strip().lower()
-    current_list = getattr(GLOBAL_CONFIG, list_name) or []
+    current_list = getattr(rule, list_name) or []
     
     if word not in current_list:
         current_list.append(word)
-        setattr(GLOBAL_CONFIG, list_name, current_list)
-        save_config_to_db(GLOBAL_CONFIG)
-        msg = f"Shabdh: **'{word}'** safaltapoorvak **{list_name.split('_')[1]}** mein jod diya gaya hai."
+        setattr(rule, list_name, current_list)
+        save_rule_to_db(rule)
+        msg = f"✅ Shabdh: **'{word}'** safaltapoorvak **{list_name.split('_')[1]}** mein jod diya gaya hai."
     else:
-        msg = f"Shabdh: **'{word}'** pehle se hi **{list_name.split('_')[1]}** mein hai."
+        msg = f"❌ Shabdh: **'{word}'** pehle se hi **{list_name.split('_')[1]}** mein hai."
 
     await update.message.reply_text(
         msg + f"\n\n{list_name.split('_')[1]}: {', '.join(current_list)}",
-        reply_markup=create_back_keyboard(callback_menu),
+        reply_markup=create_back_keyboard(f'menu_text_{rule_id}'),
         parse_mode='Markdown'
     )
     return ConversationHandler.END
 
 async def set_blacklist_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await set_list_word(update, context, "WORD_BLACKLIST", 'menu_blacklist')
+    return await set_list_word(update, context, "WORD_BLACKLIST", SET_BLACKLIST_WORD)
 
 async def set_whitelist_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await set_list_word(update, context, "WORD_WHITELIST", 'menu_whitelist')
+    return await set_list_word(update, context, "WORD_WHITELIST", SET_WHITELIST_WORD)
 
 async def set_replacement_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Gets the 'find' text and asks for the 'replace' text."""
-    # Check against saved Admin ID AND forced Admin ID
-    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
-        await update.message.reply_text("Aap Bot ke Admin nahi hain.")
-        return ConversationHandler.END
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
     
-    context.user_data['find_text'] = update.message.text.strip()
+    context.user_data['find_text'] = update.message.text
+    rule_id = context.user_data['current_rule_id']
     await update.message.reply_text(
-        f"Ab vah **Text Bhejein** jiske saath aap '{context.user_data['find_text']}' ko **Badalna (Replace)** chahte hain (Replace Text).",
-        reply_markup=create_back_keyboard('menu_replacement')
+        f"Ab vah **Text Bhejein** jiske saath aap '{context.user_data['find_text'][:20] + '...'}' ko **Badalna (Replace)** chahte hain (Replace Text).",
+        reply_markup=create_back_keyboard(f'menu_replacement_{rule_id}')
     )
     return SET_REPLACEMENT_REPLACE
 
 async def set_replacement_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Gets the 'replace' text and saves the replacement rule."""
-    global GLOBAL_CONFIG
-    # Check against saved Admin ID AND forced Admin ID
-    if GLOBAL_CONFIG.ADMIN_USER_ID is not None and update.message.chat_id != GLOBAL_CONFIG.ADMIN_USER_ID and update.message.chat_id != FORCE_ADMIN_ID:
-        await update.message.reply_text("Aap Bot ke Admin nahi hain.")
-        return ConversationHandler.END
-
-    find_text = context.user_data.pop('find_text')
-    replace_text = update.message.text.strip()
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
     
-    replacements = GLOBAL_CONFIG.TEXT_REPLACEMENTS or {}
+    find_text = context.user_data.pop('find_text')
+    rule_id = context.user_data.pop('current_rule_id')
+    replace_text = update.message.text
+    
+    rule = get_rule_by_id(rule_id)
+    if not rule: return ConversationHandler.END
+    
+    replacements = rule.TEXT_REPLACEMENTS or {}
     replacements[find_text] = replace_text
-    GLOBAL_CONFIG.TEXT_REPLACEMENTS = replacements
-    save_config_to_db(GLOBAL_CONFIG)
+    rule.TEXT_REPLACEMENTS = replacements
+    save_rule_to_db(rule)
     
     await update.message.reply_text(
-        f"**Naya Replacement Niyam** safaltapoorvak set kiya gaya:\n"
-        f"**Dhoondhein:** `{find_text}`\n"
-        f"**Badlein:** `{replace_text}`\n\n"
-        f"Current Settings:\n{get_current_settings_text(GLOBAL_CONFIG)}",
-        reply_markup=create_back_keyboard(),
+        f"✅ Rule **{rule.rule_name}** mein Naya Replacement Niyam safaltapoorvak set kiya gaya:\n"
+        f"**Dhoondhein:** `{find_text[:20] + '...'}`\n"
+        f"**Badlein:** `{replace_text[:20] + '...'}`",
+        reply_markup=create_back_keyboard(f'menu_replacement_{rule_id}'),
         parse_mode='Markdown'
     )
+    return ConversationHandler.END
+    
+async def set_prefix_suffix_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Sets the Prefix or Suffix text."""
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
+
+    text = update.message.text
+    rule_id = context.user_data.pop('current_rule_id')
+    setting = context.user_data.pop('prefix_or_suffix') # PREFIX or SUFFIX
+    
+    rule = get_rule_by_id(rule_id)
+    if not rule: return ConversationHandler.END
+
+    if text.lower().strip() == 'clear':
+        text = ""
+    
+    if setting == 'PREFIX':
+        rule.PREFIX_TEXT = text
+    else:
+        rule.SUFFIX_TEXT = text
+        
+    save_rule_to_db(rule)
+
+    action_text = "Hata diya gaya" if not text else "Set kiya gaya"
+    await update.message.reply_text(
+        f"✅ Rule **{rule.rule_name}** ka **{setting.title()}** text **{action_text}**.",
+        reply_markup=create_back_keyboard(f'menu_advanced_actions_{rule_id}'),
+        parse_mode='Markdown'
+    )
+    return ConversationHandler.END
+    
+# --- Custom Button Addition Conversation ---
+async def set_message_for_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Gets the message ID and Channel ID and asks for button data."""
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
+
+    message = update.message
+    
+    # Check if the text matches the format: [Channel_ID]:[Message_ID]
+    match = re.match(r'(-100\d+):(\d+)', message.text.strip())
+    if match:
+        context.user_data['button_target_chat_id'] = match.group(1)
+        context.user_data['button_target_message_id'] = int(match.group(2))
+    else:
+        await message.reply_text(
+             "❌ Galat Format. Kripya Target Channel ID aur Message ID is format mein bhejein: `-1001234567890:54321`", 
+             reply_markup=create_back_keyboard('add_button_menu')
+         )
+        return SET_MESSAGE_FOR_BUTTONS
+
+    await message.reply_text(
+        f"✅ Target Message ({context.user_data['button_target_chat_id']}:{context.user_data['button_target_message_id']}) mil gaya hai.\n\n"
+        f"Ab **Button Data** is format mein bhejein:\n"
+        f"`Button Text 1, URL 1 | Button Text 2, URL 2`\n\n"
+        f"Example: `Visit Website, https://example.com | Join Channel, https://t.me/yourchannel`",
+        reply_markup=create_back_keyboard('add_button_menu')
+    )
+    return SET_BUTTON_DATA
+
+async def set_button_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Processes button data and modifies the message."""
+    if not is_admin(update.message.chat_id): return ConversationHandler.END
+    
+    chat_id = context.user_data.pop('button_target_chat_id', None)
+    message_id = context.user_data.pop('button_target_message_id', None)
+    button_data = update.message.text.strip()
+    
+    if not chat_id or not message_id:
+        await update.message.reply_text("❌ Target Message ka data nahi mila. Kripya shuru se koshish karein.", reply_markup=create_back_keyboard())
+        return ConversationHandler.END
+        
+    # Parse button data
+    keyboard = []
+    try:
+        button_rows = button_data.split('|')
+        for row_data in button_rows:
+            buttons_in_row = []
+            parts = row_data.strip().split(',')
+            if len(parts) >= 2:
+                text = parts[0].strip()
+                url = parts[1].strip()
+                buttons_in_row.append(InlineKeyboardButton(text, url=url))
+            
+            if buttons_in_row:
+                 keyboard.append(buttons_in_row)
+            
+        if not keyboard:
+             raise ValueError("No valid buttons found.")
+
+        # Edit the message
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        await update.message.reply_text(
+            f"✅ Buttons safaltapoorvak Message ID **{message_id}** mein **{chat_id}** par **Jod** diye gaye hain!",
+            reply_markup=create_back_keyboard(),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error adding buttons: {e}")
+        await update.message.reply_text(
+            f"❌ Buttons jodte samay Error: `{e}`. Kripya format check karein: `Button Text, URL | Button Text 2, URL 2`",
+            reply_markup=create_back_keyboard(),
+            parse_mode='Markdown'
+        )
+    
     return ConversationHandler.END
 
 # 9. Core Forwarding Logic
 async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Checks and forwards messages based on configuration."""
+    """Checks and forwards messages based on configuration of all matching rules."""
+    
+    # Channel Posts aur regular messages dono ko handle karein
     message = update.channel_post or update.message
-    config = load_config_from_db() 
     
-    if not config.IS_FORWARDING_ACTIVE: return
-    source_id_str = config.SOURCE_CHAT_ID
-    # Check if the message comes from the set source ID(s)
-    if not (source_id_str and str(message.chat.id) in source_id_str): return
-
-    dest_id = config.DESTINATION_CHAT_ID
-    if not dest_id:
-        if config.ADMIN_USER_ID or FORCE_ADMIN_ID: # Use OR force admin ID for notification
-            admin_to_notify = config.ADMIN_USER_ID or FORCE_ADMIN_ID
-            await context.bot.send_message(admin_to_notify, f"Source Message aaya, lekin Destination ID set nahi hai!")
-        return
-
-    text_to_process = message.text or message.caption or ""
-    text_lower = text_to_process.lower()
-
-    # Filters: Links, Usernames
-    if config.BLOCK_LINKS and ('http' in text_lower or 't.me' in text_lower): return
-    if config.BLOCK_USERNAMES and re.search(r'@[a-zA-Z0-9_]+', text_lower): return
-
-    # Filters: Blacklist
-    if config.WORD_BLACKLIST:
-        for word in config.WORD_BLACKLIST:
-            if word in text_lower: return
-
-    # Filters: Whitelist (MUST contain at least one word)
-    if config.WORD_WHITELIST:
-        is_whitelisted = False
-        for word in config.WORD_WHITELIST:
-            if word in text_lower:
-                is_whitelisted = True
-                break
-        if not is_whitelisted: return
-
-    # Text Replacement Logic with modification tracking 
-    final_text = text_to_process
-    text_modified = False 
+    if not message: return
     
-    if config.TEXT_REPLACEMENTS and final_text:
-        for find, replace in config.TEXT_REPLACEMENTS.items():
-            if find in final_text:
-                final_text = final_text.replace(find, replace)
-                text_modified = True
-                
-    # Apply Delay
-    if config.FORWARD_DELAY_SECONDS > 0:
-        time.sleep(config.FORWARD_DELAY_SECONDS)
+    # --- Filter out Service Messages early ---
+    if message.service and not message.text and not message.caption:
+        pass
+    
+    # Load all rules
+    all_rules = get_all_rules()
+    
+    # Find rules where Source ID matches the incoming message's chat ID
+    matching_rules = []
+    source_id = str(message.chat.id)
+    
+    for rule in all_rules:
+        if not rule.IS_ACTIVE: continue
+        
+        # Check if the source matches the rule's source_chat_id
+        source_list = [s.strip() for s in (rule.SOURCE_CHAT_ID or "").split(',')]
+        
+        # Check against ID or username
+        if source_id in source_list or source_id.lstrip('@') in source_list or str(message.chat.username).lower() in [s.lower() for s in source_list if s.startswith('@')]:
+            matching_rules.append(rule)
 
-    # --- CORE FORWARDING MODE LOGIC ---
-    
-    # Decide whether to use copy_message based on 1. Text modification or 2. Explicit 'COPY' mode setting
-    force_copy = text_modified or (config.FORWARDING_MODE == 'COPY')
-    
-    # Check if original message had a parse_mode (using getattr for safety)
-    original_parse_mode = getattr(message, 'parse_mode', None)
+    if not matching_rules: return
 
-    # Set final parse mode: Only use original parse mode if mode is FORWARD AND no text modification happened.
-    final_parse_mode = None 
-    if config.FORWARDING_MODE == 'FORWARD' and not text_modified and original_parse_mode:
-        final_parse_mode = original_parse_mode
-    
-    try:
-        if force_copy:
-            # --- Case 1: Use copy_message (due to text modification OR 'COPY' mode) ---
+    for rule in matching_rules:
+        if not rule.DESTINATION_CHAT_ID: continue
+
+        # --- Rule-Specific Filters ---
+        
+        # Block Service Messages
+        if rule.BLOCK_SERVICE_MESSAGES and message.service:
+             continue
+             
+        # Block Forwards Filter
+        if rule.BLOCK_FORWARDS and message.forward_date is not None:
+            continue
             
-            # Message is pure text (no media)
-            if message.text and not message.caption and not message.photo and not message.video and not message.document:
-                if final_text and final_text.strip():
-                     await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
-                # If text became empty, skip.
+        # Block Replies Filter
+        if rule.BLOCK_REPLIES and message.reply_to_message is not None:
+            continue
+            
+        # Get message text/caption
+        text_to_process = message.text or message.caption or ""
+        text_lower = text_to_process.lower()
+        
+        # Block Media Filter (Pure Media only)
+        is_pure_media = bool(message.photo or message.video or message.document or message.audio or message.voice or message.sticker) and not (message.text or message.caption)
+        if rule.BLOCK_MEDIA and is_pure_media:
+            continue
+            
+        # Existing Filters: Links, Usernames
+        if rule.BLOCK_LINKS and ('http' in text_lower or 't.me' in text_lower): continue
+        if rule.BLOCK_USERNAMES and re.search(r'@[a-zA-Z0-9_]+', text_lower): continue
 
-            # Message has media (photo, video, document, etc.)
-            elif message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
-                # If final_text is empty, we send media with empty caption (removing original caption)
-                # If final_text exists, we send media with new caption
-                caption_to_send = final_text if final_text else ""
-                await context.bot.copy_message(
+        # Filters: Blacklist
+        if rule.WORD_BLACKLIST:
+            if any(word in text_lower for word in rule.WORD_BLACKLIST): continue
+
+        # Filters: Whitelist (MUST contain at least one word)
+        if rule.WORD_WHITELIST:
+            if not any(word in text_lower for word in rule.WORD_WHITELIST): continue
+
+        # --- Text Processing ---
+        
+        final_text = text_to_process
+        text_modified = False 
+        
+        # Text Replacement Logic
+        if rule.TEXT_REPLACEMENTS and final_text:
+            for find, replace in rule.TEXT_REPLACEMENTS.items():
+                if find in final_text:
+                    final_text = final_text.replace(find, replace)
+                    text_modified = True
+                    
+        # Prefix/Suffix Logic
+        if rule.PREFIX_TEXT or rule.SUFFIX_TEXT:
+            final_text = (rule.PREFIX_TEXT or "") + final_text + (rule.SUFFIX_TEXT or "")
+            text_modified = True
+            
+        # --- Core Forwarding Action ---
+        
+        # Decide whether to use copy_message (COPY mode or any modification/action required)
+        # Note on Premium Emoji: force_copy will be True if any modification happens. 
+        # Only when force_copy is FALSE (Mode is FORWARD and NO modifications/actions), the original forward is used, 
+        # which preserves Premium Emojis best.
+        force_copy = (rule.FORWARDING_MODE == 'COPY') or text_modified or rule.REMOVE_BUTTONS or rule.REMOVE_CAPTION or rule.REMOVE_WEB_PREVIEW
+        
+        # Apply Delay
+        if rule.FORWARD_DELAY_SECONDS > 0:
+            time.sleep(rule.FORWARD_DELAY_SECONDS)
+        
+        dest_id = rule.DESTINATION_CHAT_ID
+        
+        # Get original parse mode for proper formatting if no text modification occurred
+        original_parse_mode = getattr(message, 'parse_mode', None)
+
+        try:
+            if force_copy:
+                # --- Case 1: Use copy_message (Most Flexible) ---
+                
+                # If REMOVE_CAPTION is True, the text to send should be None if it's not a pure text message
+                caption_to_send = final_text
+                if rule.REMOVE_CAPTION and (message.photo or message.video or message.document):
+                    caption_to_send = None
+
+                # If the message is only text (no media)
+                if message.text and not message.caption and not message.photo and not message.video:
+                    if final_text and final_text.strip():
+                         await context.bot.send_message(
+                             chat_id=dest_id, 
+                             text=final_text, 
+                             parse_mode=original_parse_mode, 
+                             disable_web_page_preview=rule.REMOVE_WEB_PREVIEW,
+                             disable_notification=rule.SILENT_FORWARDING
+                         )
+                    # If text became empty, skip.
+
+                # Message has media
+                elif message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
+                    await context.bot.copy_message(
+                        chat_id=dest_id, 
+                        from_chat_id=message.chat.id, 
+                        message_id=message.message_id, 
+                        # Only send caption if final_text is not None/empty after all processing and REMOVE_CAPTION is not set
+                        caption=caption_to_send if caption_to_send and caption_to_send.strip() else None,
+                        parse_mode=original_parse_mode, 
+                        disable_web_page_preview=rule.REMOVE_WEB_PREVIEW,
+                        disable_notification=rule.SILENT_FORWARDING,
+                        # If REMOVE_BUTTONS is True, we explicitly set reply_markup=None to remove original buttons.
+                        reply_markup=None if rule.REMOVE_BUTTONS else (message.reply_markup if rule.FORWARDING_MODE == 'FORWARD' and not text_modified else None)
+                    )
+                
+            else:
+                # --- Case 2: Use forward_message (Original Forwarding) ---
+                # This only happens if: Mode is FORWARD AND no text/caption modification/action is set.
+                
+                await context.bot.forward_message(
                     chat_id=dest_id, 
                     from_chat_id=message.chat.id, 
-                    message_id=message.message_id, 
-                    caption=caption_to_send, 
-                    parse_mode=final_parse_mode
+                    message_id=message.message_id,
+                    disable_notification=rule.SILENT_FORWARDING
                 )
-            
-        else:
-            # --- Case 2: Use forward_message ('FORWARD' mode and no modifications) ---
-            await context.bot.forward_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id)
 
-    except Exception as e:
-        logger.error(f"Error copying/sending message: {e}")
+        except Exception as e:
+            logger.error(f"Error copying/sending message for rule {rule.id}: {e}")
+            if is_admin(FORCE_ADMIN_ID):
+                 await context.bot.send_message(FORCE_ADMIN_ID, f"❌ Forwarding Error for Rule {rule.rule_name} (ID: {rule.id}): {e}")
             
 # 10. Main Function 
 def main() -> None:
@@ -588,15 +1043,23 @@ def main() -> None:
 
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # --- Conversation Handler for Rule and Action Settings ---
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(handle_callback)],
+        entry_points=[
+            CallbackQueryHandler(handle_callback),
+        ],
         states={
-            SET_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_source_id)],
-            SET_DESTINATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_destination_id)],
+            SET_RULE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_rule_name)],
+            SET_SOURCE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_source_id)],
+            SET_DESTINATION_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_destination_id)],
             SET_REPLACEMENT_FIND: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_replacement_find)],
             SET_REPLACEMENT_REPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_replacement_replace)],
             SET_BLACKLIST_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_blacklist_word)], 
             SET_WHITELIST_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_whitelist_word)],
+            SET_PREFIX_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_prefix_suffix_text)],
+            SET_SUFFIX_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_prefix_suffix_text)],
+            SET_MESSAGE_FOR_BUTTONS: [MessageHandler(filters.ALL & ~filters.COMMAND, set_message_for_buttons)], 
+            SET_BUTTON_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_button_data)],
         },
         fallbacks=[
             CallbackQueryHandler(handle_callback),
@@ -607,19 +1070,20 @@ def main() -> None:
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    # Ensure CallbackQueryHandler is also added for simple actions outside conversation
+    application.add_handler(CallbackQueryHandler(handle_callback)) 
     
-    # Message handler for forwarding logic
+    # Message handler for core forwarding logic (listens to ALL messages/posts)
     application.add_handler(MessageHandler(filters.ALL, forward_message))
     
     # Webhook Setup for Render/Deployment
-    PORT = int(os.environ.get("PORT", "8080")) # Use 8080 as a robust default for web services
+    PORT = int(os.environ.get("PORT", "8080")) 
     WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
     if WEBHOOK_URL:
         logger.info(f"Starting bot with Webhook on URL: {WEBHOOK_URL} using port {PORT}")
         application.run_webhook(
-            listen="0.0.0.0", # This ensures binding to the host's public IP
+            listen="0.0.0.0", 
             port=PORT,
             url_path=BOT_TOKEN,
             webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
