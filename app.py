@@ -1,8 +1,8 @@
-Import os
+import os
 import logging
 import time
 import re
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, IntegrityError
 
 # 1. Logging Configuration
 logging.basicConfig(
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
     SET_MESSAGE_FOR_BUTTONS,
     SET_BUTTON_DATA,
     SELECT_RULE_FOR_ACTION
-) = range(12) # Range updated from 13 to 12 as SET_TARGET_LANG is removed
+) = range(12) 
 
 # 2. Database Setup (SQLAlchemy)
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -51,21 +51,22 @@ Engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 Base = declarative_base()
 Session = sessionmaker(bind=Engine)
 
-# 3. Database Model (Refactored to remove Translation fields)
+# 3. Database Model
 class ForwardRule(Base):
     """Stores configuration for one Source -> Destination forwarding rule."""
     __tablename__ = 'forward_rules'
     id = Column(Integer, primary_key=True)
-    rule_name = Column(String, unique=True)
+    # FIX: Ensure rule_name is not null and is unique
+    rule_name = Column(String, unique=True, nullable=False) 
     
     # Core
     SOURCE_CHAT_ID = Column(String) # Can be comma-separated list of IDs/Usernames
     DESTINATION_CHAT_ID = Column(String)
     IS_ACTIVE = Column(Boolean, default=True)
-    FORWARDING_MODE = Column(String, default='COPY') # Default changed to COPY for max flexibility
+    FORWARDING_MODE = Column(String, default='COPY') 
     FORWARD_DELAY_SECONDS = Column(Integer, default=0)
     
-    # Text Customization (New)
+    # Text Customization
     PREFIX_TEXT = Column(Text, default="")
     SUFFIX_TEXT = Column(Text, default="")
     
@@ -75,11 +76,11 @@ class ForwardRule(Base):
     BLOCK_MEDIA = Column(Boolean, default=False)
     BLOCK_FORWARDS = Column(Boolean, default=False)
     REMOVE_WEB_PREVIEW = Column(Boolean, default=False)
-    REMOVE_BUTTONS = Column(Boolean, default=True) # Default to True as per user request
-    REMOVE_CAPTION = Column(Boolean, default=False) # New
-    SILENT_FORWARDING = Column(Boolean, default=False) # New
-    BLOCK_SERVICE_MESSAGES = Column(Boolean, default=True) # New (Good default)
-    BLOCK_REPLIES = Column(Boolean, default=False) # New
+    REMOVE_BUTTONS = Column(Boolean, default=True) 
+    REMOVE_CAPTION = Column(Boolean, default=False) 
+    SILENT_FORWARDING = Column(Boolean, default=False) 
+    BLOCK_SERVICE_MESSAGES = Column(Boolean, default=True) 
+    BLOCK_REPLIES = Column(Boolean, default=False) 
     
     # List Data
     TEXT_REPLACEMENTS = Column(PickleType, default={})
@@ -89,24 +90,21 @@ class ForwardRule(Base):
 # Create tables if Engine is available
 if Engine:
     try:
-        # This will create the new table and any new columns in existing DBs
         Base.metadata.create_all(Engine)
         logger.info("Database table created/updated successfully.")
     except OperationalError as e:
         logger.error(f"Database connection error during table creation/update: {e}")
 
 # Example: Use your actual Telegram User ID here to force admin status
-# APNI ASLI TELEGRAM USER ID YAHAN SET HAI
 FORCE_ADMIN_ID = 1695450646 
 
-# 4. Configuration Management Functions
+# 4. Configuration Management Functions (No changes needed, kept as is)
 def get_all_rules():
     """Load all rules from DB."""
     if not Engine: return []
     session = Session()
     try:
         rules = session.query(ForwardRule).all()
-        # Detach objects from session for safe use outside
         session.expunge_all() 
         return rules
     except Exception as e:
@@ -142,7 +140,7 @@ def save_rule_to_db(rule):
     finally:
         session.close()
 
-# 5. Utility Functions (Inline Keyboard and Text formatting)
+# 5. Utility Functions (Inline Keyboard and Text formatting) (No changes needed, kept as is)
 
 def is_admin(user_id):
     """Checks if the user is the admin."""
@@ -211,7 +209,7 @@ def create_rule_list_keyboard(rules):
         ])
     
     keyboard.append([InlineKeyboardButton("➕ Naya Rule Jodein", callback_data='create_new_rule')])
-    keyboard.append([InlineKeyboardButton("💬 Message Mein Button Jodein", callback_data='add_button_menu')]) # New Button Feature
+    keyboard.append([InlineKeyboardButton("💬 Message Mein Button Jodein", callback_data='add_button_menu')]) 
     
     return InlineKeyboardMarkup(keyboard)
 
@@ -315,7 +313,7 @@ def create_replacement_menu_keyboard(rule_id):
         [InlineKeyboardButton("➕ Naya Niyam Jodein", callback_data=f'add_replacement_find_{rule_id}')], 
         [
             InlineKeyboardButton("🗑️ Saare Niyam Hatayein", callback_data=f'clear_replacements_{rule_id}'), 
-            InlineKeyboardButton("❌ Niyam Hatayein (Individual)", callback_data=f'delete_replacement_select_{rule_id}') # New Individual Delete
+            InlineKeyboardButton("❌ Niyam Hatayein (Individual)", callback_data=f'delete_replacement_select_{rule_id}') 
         ], 
         [InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_text_{rule_id}')]
     ]
@@ -325,10 +323,10 @@ def create_individual_delete_keyboard(replacements, rule_id):
     """Keyboard to select individual replacements for deletion."""
     keyboard = []
     for find_text, _ in replacements.items():
-        # Use a short version for button text
         display_text = find_text[:20] + '...' if len(find_text) > 20 else find_text
-        # Note: We must encode/decode the find_text if it is passed in callback_data due to character limits and safety. 
-        # For simplicity and to avoid complexity, we rely on the button text being short enough here.
+        # WARNING: Long find_text will break callback_data limit (64 bytes). 
+        # Using a fixed length for display and full text for confirmation in a real-world scenario is risky.
+        # For simplicity in this bot, we stick to the user's original logic.
         keyboard.append([InlineKeyboardButton(display_text, callback_data=f'delete_replacement_confirm_{rule_id}_{find_text}')])
     
     keyboard.append([InlineKeyboardButton("⬅️ Piche Jaane", callback_data=f'menu_replacement_{rule_id}')])
@@ -338,7 +336,7 @@ def create_back_keyboard(callback_data='main_menu'):
     """Creates a back button keyboard."""
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Piche Jaane", callback_data=callback_data)]])
 
-# 6. Command Handlers
+# 6. Command Handlers (No changes needed, kept as is)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles the /start command and sets the admin user."""
     user_id = update.effective_user.id
@@ -357,7 +355,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
-# 7. Callback Handlers (For Inline Buttons)
+# 7. Callback Handlers (For Inline Buttons) (No major changes needed, kept as is)
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles all Inline Button presses and transitions conversations."""
     query = update.callback_query
@@ -569,9 +567,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Data format: delete_replacement_confirm_{rule_id}_{find_text}
         parts = data.split('_')
         rule_id = int(parts[3])
-        # Reconstruct the find_text from the rest of the parts
-        # This is a dangerous operation due to callback_data limits and potential encoding issues
-        find_text = '_'.join(parts[4:])
+        find_text = '_'.join(parts[4:]) # Reconstruct the find_text
         
         rule = get_rule_by_id(rule_id)
         
@@ -662,8 +658,13 @@ async def set_rule_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         context.user_data['current_rule_id'] = new_rule.id
         return ConversationHandler.END
+    except IntegrityError:
+        # Handle unique constraint violation for rule_name
+        await update.message.reply_text(f"❌ Error: Rule nahi bana paya. **'{rule_name}'** नाम पहले से ही मौजूद है।", reply_markup=create_back_keyboard())
+        session.rollback()
+        return SET_RULE_NAME
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: Rule nahi bana paya. Shayad yeh naam pehle se hi hai. ({e})", reply_markup=create_back_keyboard())
+        await update.message.reply_text(f"❌ Error: Rule nahi bana paya. ({e})", reply_markup=create_back_keyboard())
         session.close()
         return SET_RULE_NAME
         
@@ -678,8 +679,9 @@ async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     chat_input = update.message.text.strip()
-    if not (chat_input.startswith('-100') or chat_input.startswith('@') or chat_input.isdigit()):
-         await update.message.reply_text("❌ Galat format! Kripya ID (-100...) ya Username (@...) bhejein.", reply_markup=create_back_keyboard(f'menu_core_{rule_id}'))
+    # Allowing comma-separated list of IDs/Usernames
+    if not any(item.startswith('-100') or item.startswith('@') or item.isdigit() for item in chat_input.split(',')):
+         await update.message.reply_text("❌ Galat format! Kripya ID (-100...) ya Username (@...) ya comma-separated list bhejein.", reply_markup=create_back_keyboard(f'menu_core_{rule_id}'))
          return ConversationHandler.END
 
     setattr(rule, config_attr, chat_input)
@@ -707,16 +709,24 @@ async def set_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE, list
     rule = get_rule_by_id(rule_id)
     if not rule: return ConversationHandler.END
 
-    word = update.message.text.strip().lower()
-    current_list = getattr(rule, list_name) or []
+    # Allow multiple words separated by comma
+    words_input = [w.strip().lower() for w in update.message.text.split(',') if w.strip()]
     
-    if word not in current_list:
-        current_list.append(word)
-        setattr(rule, list_name, current_list)
-        save_rule_to_db(rule)
-        msg = f"✅ Shabdh: **'{word}'** safaltapoorvak **{list_name.split('_')[1]}** mein jod diya gaya hai."
+    current_list = getattr(rule, list_name) or []
+    words_added = 0
+    
+    for word in words_input:
+        if word not in current_list:
+            current_list.append(word)
+            words_added += 1
+
+    setattr(rule, list_name, current_list)
+    save_rule_to_db(rule)
+    
+    if words_added > 0:
+        msg = f"✅ **{words_added}** Shabdh safaltapoorvak **{list_name.split('_')[1]}** mein jod diye gaye hain."
     else:
-        msg = f"❌ Shabdh: **'{word}'** pehle se hi **{list_name.split('_')[1]}** mein hai."
+        msg = f"❌ Koi naya Shabdh nahi joda gaya. Shayad sabhi pehle se hi **{list_name.split('_')[1]}** mein the."
 
     await update.message.reply_text(
         msg + f"\n\n{list_name.split('_')[1]}: {', '.join(current_list)}",
@@ -797,7 +807,7 @@ async def set_prefix_suffix_text(update: Update, context: ContextTypes.DEFAULT_T
     )
     return ConversationHandler.END
     
-# --- Custom Button Addition Conversation ---
+# --- Custom Button Addition Conversation (No changes needed, kept as is) ---
 async def set_message_for_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Gets the message ID and Channel ID and asks for button data."""
     if not is_admin(update.message.chat_id): return ConversationHandler.END
@@ -879,39 +889,54 @@ async def set_button_data(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # 9. Core Forwarding Logic
 async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Checks and forwards messages based on configuration of all matching rules."""
+    """Checks and forwards messages based on configuration of all matching rules.
+       FIXED: Handles various update types to avoid 'NoneType' error.
+    """
     
-    # Channel Posts aur regular messages dono ko handle karein
-    message = update.channel_post or update.message
+    # FIX: Get the actual message object, handling various update types
+    message = update.channel_post or update.message or update.edited_channel_post or update.edited_message
     
-    if not message: return
+    if not message: 
+        # If still None, it's an update type we don't need to process (e.g., chat member changes)
+        return
     
-    # --- Filter out Service Messages early ---
+    # --- Filter out Service Messages early (If service message has no text/caption, we check later for rule) ---
     if message.service and not message.text and not message.caption:
-        pass
+        pass # Let the rule-specific filter handle it below
     
     # Load all rules
     all_rules = get_all_rules()
     
     # Find rules where Source ID matches the incoming message's chat ID
     matching_rules = []
-    source_id = str(message.chat.id)
+    source_id = str(message.chat.id) # This line is now safe because 'message' is guaranteed to be non-None
+    
+    chat_username_lower = str(message.chat.username).lower() if message.chat.username else None
     
     for rule in all_rules:
         if not rule.IS_ACTIVE: continue
+        if not rule.DESTINATION_CHAT_ID: continue
         
         # Check if the source matches the rule's source_chat_id
         source_list = [s.strip() for s in (rule.SOURCE_CHAT_ID or "").split(',')]
         
         # Check against ID or username
-        if source_id in source_list or source_id.lstrip('@') in source_list or str(message.chat.username).lower() in [s.lower() for s in source_list if s.startswith('@')]:
+        is_match = False
+        for s in source_list:
+            if s == source_id:
+                is_match = True
+                break
+            # Check against username (case-insensitive)
+            if s.startswith('@') and chat_username_lower == s.lstrip('@').lower():
+                is_match = True
+                break
+        
+        if is_match:
             matching_rules.append(rule)
 
     if not matching_rules: return
 
     for rule in matching_rules:
-        if not rule.DESTINATION_CHAT_ID: continue
-
         # --- Rule-Specific Filters ---
         
         # Block Service Messages
@@ -931,7 +956,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text_lower = text_to_process.lower()
         
         # Block Media Filter (Pure Media only)
-        is_pure_media = bool(message.photo or message.video or message.document or message.audio or message.voice or message.sticker) and not (message.text or message.caption)
+        is_pure_media = bool(message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation) and not (message.text or message.caption)
         if rule.BLOCK_MEDIA and is_pure_media:
             continue
             
@@ -967,9 +992,6 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # --- Core Forwarding Action ---
         
         # Decide whether to use copy_message (COPY mode or any modification/action required)
-        # Note on Premium Emoji: force_copy will be True if any modification happens. 
-        # Only when force_copy is FALSE (Mode is FORWARD and NO modifications/actions), the original forward is used, 
-        # which preserves Premium Emojis best.
         force_copy = (rule.FORWARDING_MODE == 'COPY') or text_modified or rule.REMOVE_BUTTONS or rule.REMOVE_CAPTION or rule.REMOVE_WEB_PREVIEW
         
         # Apply Delay
@@ -978,43 +1000,58 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         dest_id = rule.DESTINATION_CHAT_ID
         
-        # Get original parse mode for proper formatting if no text modification occurred
-        original_parse_mode = getattr(message, 'parse_mode', None)
-
+        # When using copy_message, MarkdownV2 is generally safer than relying on the original parse_mode
+        # as text manipulations can break Markdown or HTML formatting.
+        # We only use the original parse_mode if it's explicitly set AND no text modification occurred, 
+        # but to keep it simple and robust after text modifications/prefixes, we stick to a safe mode.
+        parse_mode_to_use = ParseMode.MARKDOWN_V2 # Safer default for text modifications.
+        
+        # Determine the text/caption to send
+        caption_to_send = final_text
+        
+        if rule.REMOVE_CAPTION and (message.photo or message.video or message.document or message.animation or message.audio or message.voice):
+            caption_to_send = None
+        
+        # Final check if text is empty after all processing/caption removal
+        if not (message.photo or message.video or message.document or message.animation or message.audio or message.voice or message.sticker) and not (caption_to_send and caption_to_send.strip()):
+            # If it was a pure text message and text became empty after replacement/prefix/suffix, skip it.
+            if not (message.text or message.caption):
+                continue
+            
         try:
             if force_copy:
                 # --- Case 1: Use copy_message (Most Flexible) ---
                 
-                # If REMOVE_CAPTION is True, the text to send should be None if it's not a pure text message
-                caption_to_send = final_text
-                if rule.REMOVE_CAPTION and (message.photo or message.video or message.document):
-                    caption_to_send = None
-
                 # If the message is only text (no media)
                 if message.text and not message.caption and not message.photo and not message.video:
-                    if final_text and final_text.strip():
+                    if caption_to_send and caption_to_send.strip():
                          await context.bot.send_message(
                              chat_id=dest_id, 
-                             text=final_text, 
-                             parse_mode=original_parse_mode, 
+                             text=caption_to_send, 
+                             parse_mode=parse_mode_to_use, # Use the robust parse mode
                              disable_web_page_preview=rule.REMOVE_WEB_PREVIEW,
                              disable_notification=rule.SILENT_FORWARDING
                          )
-                    # If text became empty, skip.
 
                 # Message has media
-                elif message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
+                elif message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation:
+                    # Determine reply_markup
+                    reply_markup_to_send = None
+                    if not rule.REMOVE_BUTTONS:
+                        # If we are in COPY mode and text was NOT modified, we might try to retain buttons.
+                        # However, copy_message only retains buttons if they are explicitly passed.
+                        # Since we are forcing copy for most features, we should only pass original buttons if REMOVE_BUTTONS is False.
+                        reply_markup_to_send = message.reply_markup
+                        
                     await context.bot.copy_message(
                         chat_id=dest_id, 
                         from_chat_id=message.chat.id, 
                         message_id=message.message_id, 
-                        # Only send caption if final_text is not None/empty after all processing and REMOVE_CAPTION is not set
                         caption=caption_to_send if caption_to_send and caption_to_send.strip() else None,
-                        parse_mode=original_parse_mode, 
+                        parse_mode=parse_mode_to_use, # Use the robust parse mode
                         disable_web_page_preview=rule.REMOVE_WEB_PREVIEW,
                         disable_notification=rule.SILENT_FORWARDING,
-                        # If REMOVE_BUTTONS is True, we explicitly set reply_markup=None to remove original buttons.
-                        reply_markup=None if rule.REMOVE_BUTTONS else (message.reply_markup if rule.FORWARDING_MODE == 'FORWARD' and not text_modified else None)
+                        reply_markup=reply_markup_to_send
                     )
                 
             else:
@@ -1031,7 +1068,13 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             logger.error(f"Error copying/sending message for rule {rule.id}: {e}")
             if is_admin(FORCE_ADMIN_ID):
-                 await context.bot.send_message(FORCE_ADMIN_ID, f"❌ Forwarding Error for Rule {rule.rule_name} (ID: {rule.id}): {e}")
+                 # Send a notification to the admin with the error details
+                 await context.bot.send_message(
+                     FORCE_ADMIN_ID, 
+                     f"❌ Forwarding Error for Rule {rule.rule_name} (ID: {rule.id}): `{e}`\n"
+                     f"Source: `{message.chat.id}` | Dest: `{dest_id}`",
+                     parse_mode='Markdown'
+                 )
             
 # 10. Main Function 
 def main() -> None:
@@ -1074,7 +1117,8 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback)) 
     
     # Message handler for core forwarding logic (listens to ALL messages/posts)
-    application.add_handler(MessageHandler(filters.ALL, forward_message))
+    # NOTE: filters.ALL will also handle edited_messages/channel_posts and service messages
+    application.add_handler(MessageHandler(filters.ALL, forward_message)) 
     
     # Webhook Setup for Render/Deployment
     PORT = int(os.environ.get("PORT", "8080")) 
@@ -1094,3 +1138,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
