@@ -13,12 +13,14 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-# FIX 2: Correctly import ParseMode from telegram.constants
+# FIX 1: Correctly import ParseMode from telegram.constants
 from telegram.constants import ParseMode 
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm.exc import DetachedInstanceError, ObjectNotExecutableError
+# FIX 2: Correctly import exceptions as their location changed in newer SQLAlchemy versions
+from sqlalchemy.exc import OperationalError, ObjectNotExecutableError
+from sqlalchemy.orm.exc import DetachedInstanceError
+
 
 # 1. Logging Configuration
 logging.basicConfig(
@@ -118,7 +120,7 @@ def get_fresh_rule_or_config(model, entity_id=1):
             entity = session.query(ForwardingRule).filter(ForwardingRule.id == entity_id).first()
             
         if entity:
-            # CRITICAL FIX: Always detach the object using expunge before returning
+            # CRITICAL FIX (from previous attempt): Always detach the object using expunge before returning
             session.expunge(entity) 
             return entity
             
@@ -139,7 +141,7 @@ def get_fresh_rule_or_config(model, entity_id=1):
         # Return a safe fallback object
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
     finally:
-        # CRITICAL FIX: Ensure session is always closed
+        # CRITICAL FIX (from previous attempt): Ensure session is always closed
         if session:
             session.close()
 
@@ -153,7 +155,7 @@ def save_global_config_to_db(config):
     if not Engine: return
     session = Session()
     try:
-        # CRITICAL FIX: Use merge to handle the detached instance
+        # CRITICAL FIX (from previous attempt): Use merge to handle the detached instance
         session.merge(config)
         session.commit()
     except Exception as e:
@@ -188,7 +190,7 @@ def save_rule_to_db(rule):
     if not Engine: return
     session = Session()
     try:
-        # CRITICAL FIX: Use merge to handle both new rules (no ID) and updates (with ID, including detached)
+        # CRITICAL FIX (from previous attempt): Use merge to handle both new rules (no ID) and updates (with ID, including detached)
         merged_rule = session.merge(rule)
         session.flush() # Get the ID for new rule
         session.commit()
@@ -220,7 +222,8 @@ def delete_rule_from_db(rule_id):
             session.close()
 
 # Global config instance (Loaded on startup, used for display/initial check only)
-GLOBAL_CONFIG_INITIAL = load_global_config_from_db()
+# CRITICAL: This is the line that triggered the original DetachedInstanceError
+GLOBAL_CONFIG_INITIAL = load_global_config_from_db() 
 
 # 5. Utility Functions (Inline Keyboard and Text formatting)
 def get_rule_settings_text(rule):
@@ -912,14 +915,21 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if final_text or message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation or message.poll:
             if global_config.GLOBAL_HEADER:
                 # Only prepend header if it's not already there (to avoid double headers on edits/multiple forwards)
-                if not final_text.strip().startswith(global_config.GLOBAL_HEADER.strip()):
+                if final_text and not final_text.strip().startswith(global_config.GLOBAL_HEADER.strip()):
                     final_text = global_config.GLOBAL_HEADER + "\n\n" + final_text
                     text_modified = True
+                elif not final_text:
+                    final_text = global_config.GLOBAL_HEADER
+                    text_modified = True
+            
             if global_config.GLOBAL_FOOTER:
                 # Only append footer if it's not already there
-                if not final_text.strip().endswith(global_config.GLOBAL_FOOTER.strip()):
+                if final_text and not final_text.strip().endswith(global_config.GLOBAL_FOOTER.strip()):
                     final_text = final_text + "\n\n" + global_config.GLOBAL_FOOTER
                     text_modified = True
+                elif not final_text:
+                     final_text = global_config.GLOBAL_FOOTER
+                     text_modified = True
 
         # Apply Delay (Rule Specific)
         if rule.FORWARD_DELAY_SECONDS > 0:
