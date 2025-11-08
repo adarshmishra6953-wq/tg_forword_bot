@@ -18,7 +18,7 @@ from telegram.constants import ParseMode
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm.exc import DetachedInstanceError
+from sqlalchemy.orm.exc import DetachedInstanceError, ObjectNotExecutableError
 
 # 1. Logging Configuration
 logging.basicConfig(
@@ -95,7 +95,7 @@ FORCE_ADMIN_ID = 1695450646
 
 # 4. Configuration Management Functions
 def get_fresh_rule_or_config(model, entity_id=1):
-    """Loads a fresh, attached entity (Rule or GlobalConfig) from DB."""
+    """Loads a fresh, detached entity (Rule or GlobalConfig) from DB."""
     if not Engine: 
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
         
@@ -118,8 +118,13 @@ def get_fresh_rule_or_config(model, entity_id=1):
             entity = session.query(ForwardingRule).filter(ForwardingRule.id == entity_id).first()
             
         if entity:
-            session.expunge(entity) # Detach object before returning
+            # FIX 1: Always detach the object before returning to prevent DetachedInstanceError
+            session.expunge(entity) 
         return entity
+    except ObjectNotExecutableError:
+        # Ignore errors if the query itself failed due to a transient issue
+        logger.warning(f"SQLAlchemy query failed for {model.__name__} ID {entity_id}. Returning None.")
+        return None
     except Exception as e:
         logger.error(f"Error loading fresh entity {model.__name__} ID {entity_id}: {e}")
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
@@ -135,7 +140,7 @@ def save_global_config_to_db(config):
     if not Engine: return
     session = Session()
     try:
-        # Use merge for consistency and handling detached instances
+        # Use merge for consistency and handling detached instances (FIX 1)
         session.merge(config)
         session.commit()
     except Exception as e:
@@ -167,12 +172,12 @@ def save_rule_to_db(rule):
     if not Engine: return
     session = Session()
     try:
-        # FIX 1: Use merge to handle both new rules (no ID) and updates (with ID)
+        # FIX 1: Use merge to handle both new rules (no ID) and updates (with ID, including detached)
         if rule.id is None:
             # New rule
             session.add(rule)
         else:
-            # Existing rule update (merge handles detached instance error)
+            # Existing rule update - merge handles detached instance error gracefully
             session.merge(rule)
             
         session.flush() # Get the ID for new rule
@@ -250,6 +255,8 @@ def create_main_menu_keyboard():
         [InlineKeyboardButton("➕ Naya Rule Jodein", callback_data='new_rule')],
         [InlineKeyboardButton("📝 Rules Manage Karein", callback_data='manage_rules')],
         [InlineKeyboardButton("⚙️ Global Settings", callback_data='menu_global_settings')],
+        # NEW FIX 2: Added Restart Button
+        [InlineKeyboardButton("🔄 Restart Bot (Reload Config)", callback_data='restart_bot_command')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -325,13 +332,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         save_global_config_to_db(GLOBAL_CONFIG)
         logger.info(f"Admin User ID set to: {user_id}")
     
-    await update.message.reply_text(
-        f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
-        f"**Global Settings:**\n{get_global_settings_text(GLOBAL_CONFIG)}",
-        reply_markup=create_main_menu_keyboard(),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    # Check if we are responding to a message or a callback/command
+    if update.callback_query:
+         await update.callback_query.edit_message_text(
+            f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
+            f"**Global Settings:**\n{get_global_settings_text(GLOBAL_CONFIG)}",
+            reply_markup=create_main_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(
+            f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
+            f"**Global Settings:**\n{get_global_settings_text(GLOBAL_CONFIG)}",
+            reply_markup=create_main_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
     return ConversationHandler.END
+
+# NEW FIX 2: Restart Handler
+async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles the /restart command or button click."""
+    if update.callback_query:
+        # Check admin for button
+        if not is_admin(update.callback_query.from_user.id):
+            await update.callback_query.answer("Aap Bot ke Admin nahi hain.")
+            return
+        await update.callback_query.answer("Bot Configuration Reload Ho Raha Hai...")
+        await start(update, context)
+    elif update.message:
+        # Check admin for command
+        if not is_admin(update.message.from_user.id):
+             await update.message.reply_text("Aap Bot ke Admin nahi hain.")
+             return
+        await update.message.reply_text("Bot Configuration Reload Ho Raha Hai...")
+        await start(update, context)
+
+    return ConversationHandler.END
+
 
 # 8. Callback Handlers (For Inline Buttons)
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -343,12 +380,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
 
     # Admin Check
-    if not is_admin(chat_id):
+    if not is_admin(query.from_user.id):
         await query.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
         return
 
     # Reload global config to get fresh object
     GLOBAL_CONFIG = load_global_config_from_db() 
+
+    # --- Restart Handler ---
+    if data == 'restart_bot_command':
+        return await restart_bot_command(update, context)
 
     # --- Global Menus ---
     if data == 'main_menu':
@@ -453,6 +494,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == 'toggle_block_links': rule.BLOCK_LINKS = not rule.BLOCK_LINKS
         elif action == 'toggle_block_usernames': rule.BLOCK_USERNAMES = not rule.BLOCK_USERNAMES
         
+        # FIX 1: The merge in save_rule_to_db should handle the detached error now.
         save_rule_to_db(rule)
         
         # Go back to rule edit menu
@@ -524,7 +566,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_rule_id'] = rule_id
         rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Shabdh Blacklist Karein", callback_data=f'add_blacklist_word_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Blacklist Hatayein", callback_data=f'clear_blacklist_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
-        await query.edit_message_text(f"**Rule {rule_id} Blacklist Settings**\n\nCurrent Blacklisted Words: {', '.join(rule.WORD_BLACKLIST or []) or 'Koi nahi'}", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(f"**Rule {rule_id} Blacklist Settings**\n\nCurrent Blacklisted Words: {', '.join(rule.WORD_BLACKLIST or []) or 'Koi nahi'}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
         
     elif data.startswith('add_blacklist_word_'):
@@ -547,7 +589,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_rule_id'] = rule_id
         rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Shabdh Whitelist Karein", callback_data=f'add_whitelist_word_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Whitelist Hatayein", callback_data=f'clear_whitelist_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
-        await query.edit_message_text(f"**Rule {rule_id} Whitelist Settings**\n\nCurrent Whitelisted Words: {', '.join(rule.WORD_WHITELIST or []) or 'Koi nahi'} (Inka hona jaruri hai)", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(f"**Rule {rule_id} Whitelist Settings**\n\nCurrent Whitelisted Words: {', '.join(rule.WORD_WHITELIST or []) or 'Koi nahi'} (Inka hona jaruri hai)", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
 
     elif data.startswith('add_whitelist_word_'):
@@ -570,6 +612,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_rule_id'] = rule_id
         rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Naya Niyam Jodein", callback_data=f'add_replacement_find_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Niyam Hatayein", callback_data=f'clear_replacements_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
+        # Use query.edit_message_text to update the message with the rule settings
         await query.edit_message_text(f"**Rule {rule_id} Text Replacement Niyam**\n\n{get_rule_settings_text(rule)}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
 
@@ -865,7 +908,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # --- CORE FORWARDING MODE LOGIC ---
         force_copy = text_modified or (rule.FORWARDING_MODE == 'COPY')
         
-        # FIX 3: Use getattr safely for parse_mode, which might not exist on all message types (e.g. caption-less media)
+        # Use getattr safely for parse_mode, which might not exist on all message types (e.g. caption-less media)
         original_parse_mode = getattr(message, 'parse_mode', None)
 
         # Determine final parse mode for copy_message
@@ -884,7 +927,6 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 # Pure Text Message
                 if message.text and not message.caption:
                     if final_text and final_text.strip():
-                         # FIX 5: Added disable_web_page_preview
                          await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
                 
                 # Message has media
@@ -916,8 +958,12 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
     
     # ----------------------------------------------------------------------
-    # Conversation Handler Setup
+    # Command and Conversation Handler Setup
     # ----------------------------------------------------------------------
+    application.add_handler(CommandHandler("start", start))
+    # NEW FIX 2: Added /restart command handler
+    application.add_handler(CommandHandler("restart", restart_bot_command))
+    
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_callback)],
         states={
@@ -939,11 +985,11 @@ def main() -> None:
         fallbacks=[
             CallbackQueryHandler(handle_callback),
             CommandHandler("start", start),
+            CommandHandler("restart", restart_bot_command), # Added restart to fallbacks
         ],
         allow_reentry=True
     )
     
-    application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     
     # Message handler for forwarding logic (must be last)
