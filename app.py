@@ -47,6 +47,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     logger.warning("DATABASE_URL environment variable is not set. Bot will not save settings.")
 
+# Standardize postgresql:// for SQLAlchemy 2.0+ compatibility
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -1060,6 +1061,7 @@ def main() -> None:
     application.add_handler(conv_handler)
     
     # Message handler for forwarding logic (must be last)
+    # Exclude EDITED_CHANNEL_POST to avoid issues with message reprocessing
     application.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.EDITED_CHANNEL_POST, forward_message))
     
     # Webhook Setup for Render/Deployment
