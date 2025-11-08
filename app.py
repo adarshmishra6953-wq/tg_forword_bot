@@ -489,10 +489,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule_id = int(data.split('_')[2])
         delete_rule_from_db(rule_id)
         rules = get_all_rules()
-        await query.edit_message_text(
-            f"**Rule {rule_id}** safaltapoorvak **Hata Diya Gaya** hai.\n\nAapke pass kul {len(rules)} Rules hain.",
-            reply_markup=create_manage_rules_keyboard(rules)
-        )
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Rule {rule_id}** safaltapoorvak **Hata Diya Gaya** hai.\n\nAapke pass kul {len(rules)} Rules hain.",
+                reply_markup=create_manage_rules_keyboard(rules)
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Delete Safal. Rules List Reload Ho Gayi Hai.") 
+            else:
+                raise
         return ConversationHandler.END
         
     # --- Global Settings Menu ---
@@ -503,13 +511,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"⏰ Schedule Sleep ({'✅' if current_config.SCHEDULE_ACTIVE else '❌'})", callback_data='toggle_schedule_active')],
             [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]
         ]
-        await query.edit_message_text(
-            f"**Global Settings**\n\n{get_global_settings_text(current_config)}\n\n"
-            f"Header Sample: `{'Set' if current_config.GLOBAL_HEADER else 'Nahi'}`\n"
-            f"Footer Sample: `{'Set' if current_config.GLOBAL_FOOTER else 'Nahi'}`",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Global Settings**\n\n{get_global_settings_text(current_config)}\n\n"
+                f"Header Sample: `{'Set' if current_config.GLOBAL_HEADER else 'Nahi'}`\n"
+                f"Footer Sample: `{'Set' if current_config.GLOBAL_FOOTER else 'Nahi'}`",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Global Settings Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
 
     elif data == 'set_global_header':
@@ -525,12 +541,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_config.SCHEDULE_ACTIVE = not current_config.SCHEDULE_ACTIVE
         save_global_config_to_db(current_config)
         
-        await query.edit_message_text(
-            f"**Scheduled Sleep** ab **{'Shuru' if current_config.SCHEDULE_ACTIVE else 'Ruka Hua'}** hai.\n\n"
-            f"Current Schedule: {current_config.SLEEP_START_HOUR:02d}:00 to {current_config.SLEEP_END_HOUR:02d}:00",
-            reply_markup=create_back_keyboard('menu_global_settings'),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Scheduled Sleep** ab **{'Shuru' if current_config.SCHEDULE_ACTIVE else 'Ruka Hua'}** hai.\n\n"
+                f"Current Schedule: {current_config.SLEEP_START_HOUR:02d}:00 to {current_config.SLEEP_END_HOUR:02d}:00",
+                reply_markup=create_back_keyboard('menu_global_settings'),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Schedule Status Badal Diya Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
 
 
@@ -586,7 +609,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("60 Sec (1 Minute)", callback_data=f'set_delay_60_{rule_id}')],
             [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]
         ]
-        await query.edit_message_text(f"Rule **{rule_id}** ke liye Delay chunein. Current: {rule.FORWARD_DELAY_SECONDS}s", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"Rule **{rule_id}** ke liye Delay chunein. Current: {rule.FORWARD_DELAY_SECONDS}s", reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Delay Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
         
     elif data.startswith('set_delay_'):
@@ -596,11 +627,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule = get_rule_by_id(rule_id) 
         rule.FORWARD_DELAY_SECONDS = delay
         save_rule_to_db(rule)
-        await query.edit_message_text(
-            f"**Rule {rule_id} Delay:** Ab `{delay} seconds` set kar diya gaya hai.",
-            reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Rule {rule_id} Delay:** Ab `{delay} seconds` set kar diya gaya hai.",
+                reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Delay Safaltapoorvak Set.") 
+            else:
+                raise
         return ConversationHandler.END
 
     # Forwarding Mode Menu (Rule Specific)
@@ -612,7 +651,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"2. Copy (Caption Editing) {'✅' if rule.FORWARDING_MODE == 'COPY' else '❌'}", callback_data=f'set_mode_copy_{rule_id}')],
             [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]
         ]
-        await query.edit_message_text("Message Forwarding ka **Mode** chunein:", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text("Message Forwarding ka **Mode** chunein:", reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Mode Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
 
     elif data.startswith('set_mode_'):
@@ -622,11 +669,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule = get_rule_by_id(rule_id) 
         rule.FORWARDING_MODE = mode
         save_rule_to_db(rule)
-        await query.edit_message_text(
-            f"**Rule {rule_id} Forwarding Mode** ab `{mode}` set kar diya gaya hai.",
-            reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Rule {rule_id} Forwarding Mode** ab `{mode}` set kar diya gaya hai.",
+                reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Mode Safaltapoorvak Set.") 
+            else:
+                raise
         return ConversationHandler.END
 
 
@@ -636,7 +691,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_rule_id'] = rule_id
         rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Shabdh Blacklist Karein", callback_data=f'add_blacklist_word_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Blacklist Hatayein", callback_data=f'clear_blacklist_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
-        await query.edit_message_text(f"**Rule {rule_id} Blacklist Settings**\n\nCurrent Blacklisted Words: {', '.join(rule.WORD_BLACKLIST or []) or 'Koi nahi'}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"**Rule {rule_id} Blacklist Settings**\n\nCurrent Blacklisted Words: {', '.join(rule.WORD_BLACKLIST or []) or 'Koi nahi'}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Blacklist Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
         
     elif data.startswith('add_blacklist_word_'):
@@ -650,7 +713,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule = get_rule_by_id(rule_id) 
         rule.WORD_BLACKLIST = []
         save_rule_to_db(rule)
-        await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Blacklisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Blacklisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Blacklist Clear Safaltapoorvak.") 
+            else:
+                raise
         return ConversationHandler.END
         
     # Whitelist Menu (Rule Specific)
@@ -659,7 +730,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_rule_id'] = rule_id
         rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Shabdh Whitelist Karein", callback_data=f'add_whitelist_word_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Whitelist Hatayein", callback_data=f'clear_whitelist_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
-        await query.edit_message_text(f"**Rule {rule_id} Whitelist Settings**\n\nCurrent Whitelisted Words: {', '.join(rule.WORD_WHITELIST or []) or 'Koi nahi'} (Inka hona jaruri hai)", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"**Rule {rule_id} Whitelist Settings**\n\nCurrent Whitelisted Words: {', '.join(rule.WORD_WHITELIST or []) or 'Koi nahi'} (Inka hona jaruri hai)", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Whitelist Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
 
     elif data.startswith('add_whitelist_word_'):
@@ -673,7 +752,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule = get_rule_by_id(rule_id) 
         rule.WORD_WHITELIST = []
         save_rule_to_db(rule)
-        await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Whitelisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Whitelisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Whitelist Clear Safaltapoorvak.") 
+            else:
+                raise
         return ConversationHandler.END
         
     # Replacement Menu (Rule Specific)
@@ -682,7 +769,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_rule_id'] = rule_id
         rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Naya Niyam Jodein", callback_data=f'add_replacement_find_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Niyam Hatayein", callback_data=f'clear_replacements_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
-        await query.edit_message_text(f"**Rule {rule_id} Text Replacement Niyam**\n\n{get_rule_settings_text(rule)}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"**Rule {rule_id} Text Replacement Niyam**\n\n{get_rule_settings_text(rule)}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Replacement Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
 
     elif data.startswith('add_replacement_find_'):
@@ -696,7 +791,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule = get_rule_by_id(rule_id) 
         rule.TEXT_REPLACEMENTS = {}
         save_rule_to_db(rule)
-        await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Replacement Niyam** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
+        
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Replacement Niyam** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Replacements Clear Safaltapoorvak.") 
+            else:
+                raise
         return ConversationHandler.END
 
     return ConversationHandler.END 
