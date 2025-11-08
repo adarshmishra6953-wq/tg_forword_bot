@@ -13,11 +13,11 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-# FIX 1: Correctly import ParseMode from telegram.constants
+# FIX 1: Correctly import ParseMode
 from telegram.constants import ParseMode 
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
-# FIX 2: Correctly import exceptions as their location changed in newer SQLAlchemy versions
+# FIX 2: Correctly import exceptions for newer SQLAlchemy versions
 from sqlalchemy.exc import OperationalError, ObjectNotExecutableError
 from sqlalchemy.orm.exc import DetachedInstanceError
 
@@ -120,7 +120,7 @@ def get_fresh_rule_or_config(model, entity_id=1):
             entity = session.query(ForwardingRule).filter(ForwardingRule.id == entity_id).first()
             
         if entity:
-            # CRITICAL FIX (from previous attempt): Always detach the object using expunge before returning
+            # CRITICAL FIX: Always detach the object using expunge before returning
             session.expunge(entity) 
             return entity
             
@@ -141,7 +141,7 @@ def get_fresh_rule_or_config(model, entity_id=1):
         # Return a safe fallback object
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
     finally:
-        # CRITICAL FIX (from previous attempt): Ensure session is always closed
+        # CRITICAL FIX: Ensure session is always closed
         if session:
             session.close()
 
@@ -155,7 +155,7 @@ def save_global_config_to_db(config):
     if not Engine: return
     session = Session()
     try:
-        # CRITICAL FIX (from previous attempt): Use merge to handle the detached instance
+        # CRITICAL FIX: Use merge to handle the detached instance
         session.merge(config)
         session.commit()
     except Exception as e:
@@ -190,7 +190,7 @@ def save_rule_to_db(rule):
     if not Engine: return
     session = Session()
     try:
-        # CRITICAL FIX (from previous attempt): Use merge to handle both new rules (no ID) and updates (with ID, including detached)
+        # CRITICAL FIX: Use merge to handle both new rules (no ID) and updates (with ID, including detached)
         merged_rule = session.merge(rule)
         session.flush() # Get the ID for new rule
         session.commit()
@@ -222,7 +222,6 @@ def delete_rule_from_db(rule_id):
             session.close()
 
 # Global config instance (Loaded on startup, used for display/initial check only)
-# CRITICAL: This is the line that triggered the original DetachedInstanceError
 GLOBAL_CONFIG_INITIAL = load_global_config_from_db() 
 
 # 5. Utility Functions (Inline Keyboard and Text formatting)
@@ -359,12 +358,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     # Check if we are responding to a message or a callback/command
     if update.callback_query:
-         await update.callback_query.edit_message_text(
-            f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
-            f"**Global Settings:**\n{get_global_settings_text(current_config)}",
-            reply_markup=create_main_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
+         # FIX: Wrap in try/except to avoid 'Message is not modified' on double click/re-entry
+         try:
+             await update.callback_query.edit_message_text(
+                f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
+                f"**Global Settings:**\n{get_global_settings_text(current_config)}",
+                reply_markup=create_main_menu_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+         except Exception as e:
+            if "Message is not modified" in str(e):
+                await update.callback_query.answer("Menu Reload Ho Gaya Hai.")
+            else:
+                raise
+                
     elif update.message:
         await update.message.reply_text(
             f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
@@ -388,6 +395,7 @@ async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     if update.callback_query:
+        # A simple answer is enough before calling start (which handles edit_message_text)
         await update.callback_query.answer("Bot Configuration Reload Ho Raha Hai...")
     elif update.message:
         await update.message.reply_text("Bot Configuration Reload Ho Raha Hai...")
@@ -419,19 +427,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Global Menus ---
     if data == 'main_menu':
-        await query.edit_message_text(
-            f"**Mukhya Menu (Main Menu)**\n\n**Global Settings:**\n{get_global_settings_text(current_config)}",
-            reply_markup=create_main_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Mukhya Menu (Main Menu)**\n\n**Global Settings:**\n{get_global_settings_text(current_config)}",
+                reply_markup=create_main_menu_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
 
     elif data == 'manage_rules':
         rules = get_all_rules()
-        await query.edit_message_text(
-            f"**Forwarding Rules Manage Karein**\n\nAapke pass kul {len(rules)} Rules hain.",
-            reply_markup=create_manage_rules_keyboard(rules)
-        )
+        try:
+            await query.edit_message_text(
+                f"**Forwarding Rules Manage Karein**\n\nAapke pass kul {len(rules)} Rules hain.",
+                reply_markup=create_manage_rules_keyboard(rules)
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Rules List Reload Ho Gayi Hai.") 
+            else:
+                raise
         return ConversationHandler.END
         
     elif data == 'new_rule':
@@ -449,11 +470,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Rule maujood nahi hai.", reply_markup=create_back_keyboard('manage_rules'))
             return ConversationHandler.END
             
-        await query.edit_message_text(
-            f"**Rule {rule_id} Edit Karein**\n\n{get_rule_settings_text(rule)}",
-            reply_markup=create_rule_edit_keyboard(rule),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        # FIX: Wrap in try/except to avoid 'Message is not modified'
+        try:
+            await query.edit_message_text(
+                f"**Rule {rule_id} Edit Karein**\n\n{get_rule_settings_text(rule)}",
+                reply_markup=create_rule_edit_keyboard(rule),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Rule Menu Reload Ho Gaya Hai.") 
+            else:
+                raise
         return ConversationHandler.END
         
     elif data.startswith('delete_rule_'):
@@ -527,11 +555,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Go back to rule edit menu, reload rule for fresh display data
         rule_after_save = get_rule_by_id(rule_id) 
         
-        await query.edit_message_text(
-            f"**Rule {rule_id} Setting Updated**\n\n{get_rule_settings_text(rule_after_save)}",
-            reply_markup=create_rule_edit_keyboard(rule_after_save),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        # --- CRITICAL FIX: Wrap in try/except to avoid 'Message is not modified' ---
+        try:
+            await query.edit_message_text(
+                f"**Rule {rule_id} Setting Updated**\n\n{get_rule_settings_text(rule_after_save)}",
+                reply_markup=create_rule_edit_keyboard(rule_after_save),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            # Catch the specific error that happens when the message content hasn't changed
+            if "Message is not modified" in str(e):
+                # Answer the query with a notification popup to confirm success
+                await query.answer("Status/Setting Badal Diya Gaya Hai.") 
+            else:
+                 # Re-raise any other unexpected error
+                logger.error(f"Error editing message for rule {rule_id} toggle: {e}")
+                raise
+
         return ConversationHandler.END
 
     # --- Rule Nested Menus ---
