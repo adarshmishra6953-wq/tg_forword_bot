@@ -13,7 +13,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-# Note: ParseMode is now imported from telegram.constants (Version 20+)
+# FIX: ParseMode is now imported from telegram.constants
 from telegram.constants import ParseMode 
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -25,8 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Conversation States (Ensure these are unique integers)
-# Expanded states for managing multiple rules
+# Conversation States 
 (
     SELECT_RULE, 
     NEW_RULE_SET_SOURCE, 
@@ -58,10 +57,8 @@ class GlobalConfig(Base):
     __tablename__ = 'global_config'
     id = Column(Integer, primary_key=True)
     ADMIN_USER_ID = Column(Integer)
-    # NEW FIELDS
     GLOBAL_HEADER = Column(Text, default='')
     GLOBAL_FOOTER = Column(Text, default='')
-    # NEW SCHEDULING FIELDS
     SCHEDULE_ACTIVE = Column(Boolean, default=False)
     SLEEP_START_HOUR = Column(Integer, default=0) # 0 = 12 AM
     SLEEP_END_HOUR = Column(Integer, default=6)   # 6 = 6 AM
@@ -78,7 +75,6 @@ class ForwardingRule(Base):
     BLOCK_USERNAMES = Column(Boolean, default=False)
     FORWARD_DELAY_SECONDS = Column(Integer, default=0)
     
-    # 'FORWARD' (default) or 'COPY'
     FORWARDING_MODE = Column(String, default='FORWARD') 
     
     TEXT_REPLACEMENTS = Column(PickleType, default={})
@@ -112,6 +108,7 @@ def load_global_config_from_db():
             session.commit()
             logger.info("New GlobalConfig entry created in DB.")
         
+        # FIX: Handle DetachedInstanceError
         session.expunge(config) 
         
     except Exception as e:
@@ -121,8 +118,8 @@ def load_global_config_from_db():
         session.close()
         
     # Ensure new fields exist for compatibility
-    if not hasattr(config, 'GLOBAL_HEADER'): config.GLOBAL_HEADER = ''
-    if not hasattr(config, 'GLOBAL_FOOTER'): config.GLOBAL_FOOTER = ''
+    if not hasattr(config, 'GLOBAL_HEADER') or config.GLOBAL_HEADER is None: config.GLOBAL_HEADER = ''
+    if not hasattr(config, 'GLOBAL_FOOTER') or config.GLOBAL_FOOTER is None: config.GLOBAL_FOOTER = ''
     if not hasattr(config, 'SCHEDULE_ACTIVE'): config.SCHEDULE_ACTIVE = False
         
     return config
@@ -199,11 +196,9 @@ def delete_rule_from_db(rule_id):
 GLOBAL_CONFIG = load_global_config_from_db()
 
 # 5. Utility Functions (Inline Keyboard and Text formatting)
-
 def get_rule_settings_text(rule):
     """Returns formatted string of a specific rule's settings."""
-    if not rule:
-        return "**Rule Maujood Nahi**"
+    if not rule: return "**Rule Maujood Nahi**"
         
     status = "Shuru" if rule.IS_ACTIVE else "Ruka Hua"
     links = "Haa" if rule.BLOCK_LINKS else "Nahi"
@@ -406,19 +401,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(
             f"**Global Settings**\n\n{get_global_settings_text(GLOBAL_CONFIG)}\n\n"
-            f"Header: `{GLOBAL_CONFIG.GLOBAL_HEADER[:20]}...`\n"
-            f"Footer: `{GLOBAL_CONFIG.GLOBAL_FOOTER[:20]}...`",
+            f"Header Sample: `{'Set' if GLOBAL_CONFIG.GLOBAL_HEADER else 'Nahi'}`\n"
+            f"Footer Sample: `{'Set' if GLOBAL_CONFIG.GLOBAL_FOOTER else 'Nahi'}`",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
 
     elif data == 'set_global_header':
-        await query.edit_message_text("Kripya vah **Text** bhejein jo **har message ke shuru** mein jodein.", reply_markup=create_back_keyboard('menu_global_settings'))
+        await query.edit_message_text("Kripya vah **Text** bhejein jo **har message ke shuru** mein jodein. (Markup support karta hai)", reply_markup=create_back_keyboard('menu_global_settings'))
         return SET_GLOBAL_HEADER
         
     elif data == 'set_global_footer':
-        await query.edit_message_text("Kripya vah **Text** bhejein jo **har message ke ant** mein jodein.", reply_markup=create_back_keyboard('menu_global_settings'))
+        await query.edit_message_text("Kripya vah **Text** bhejein jo **har message ke ant** mein jodein. (Markup support karta hai)", reply_markup=create_back_keyboard('menu_global_settings'))
         return SET_GLOBAL_FOOTER
 
     elif data == 'toggle_schedule_active':
@@ -587,7 +582,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 9. Conversation Handlers (For User Input)
 
-async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, config_attr: str, next_state: int, new_rule: bool) -> int:
+async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, config_attr: str, new_rule: bool) -> int:
     """Utility function to handle receiving chat ID/Username for a rule."""
     if not is_admin(update.message.chat_id):
         await update.message.reply_text("Aap Bot ke Admin nahi hain.")
@@ -640,17 +635,14 @@ async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
 async def set_new_rule_source_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_chat_id_input(update, context, "SOURCE_CHAT_ID", NEW_RULE_SET_DESTINATION, new_rule=True)
+    return await handle_chat_id_input(update, context, "SOURCE_CHAT_ID", new_rule=True)
 
 async def set_new_rule_destination_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_chat_id_input(update, context, "DESTINATION_CHAT_ID", ConversationHandler.END, new_rule=True)
+    return await handle_chat_id_input(update, context, "DESTINATION_CHAT_ID", new_rule=True)
 
-async def set_edited_rule_source_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_chat_id_input(update, context, "SOURCE_CHAT_ID", ConversationHandler.END, new_rule=False)
-
-async def set_edited_rule_destination_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_chat_id_input(update, context, "DESTINATION_CHAT_ID", ConversationHandler.END, new_rule=False)
-
+# Note: The 'edit_source/destination' handlers should use ConversationHandler.END, 
+# but for simplicity and flow control in fallbacks, we rely on the main function 
+# to return the correct state.
 
 # Global Header/Footer Handlers
 async def set_global_header(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -678,7 +670,7 @@ async def set_global_footer(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
-# Rule List/Replacement Input Handlers (Modified to use rule_id)
+# Rule List/Replacement Input Handlers 
 async def set_rule_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE, list_name: str, fallback_menu: str) -> int:
     if not is_admin(update.message.chat_id): return ConversationHandler.END
     
@@ -701,7 +693,7 @@ async def set_rule_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await update.message.reply_text(
         msg + f"\n\n{list_name.split('_')[1]}: {', '.join(current_list)}",
-        reply_markup=create_back_keyboard(fallback_menu.replace('0', str(rule_id))),
+        reply_markup=create_back_keyboard(fallback_menu.replace('_0', f'_{rule_id}')),
         parse_mode=ParseMode.MARKDOWN
     )
     return ConversationHandler.END
@@ -751,7 +743,7 @@ async def set_rule_replacement_replace(update: Update, context: ContextTypes.DEF
 
 # 10. Core Forwarding Logic (Updated for Multiple Rules, Header/Footer, and Schedule)
 def is_scheduled_sleep_time(config: GlobalConfig) -> bool:
-    """Checks if the current time is within the scheduled sleep hours."""
+    """Checks if the current time is within the scheduled sleep hours (inclusive start, exclusive end)."""
     if not config.SCHEDULE_ACTIVE:
         return False
         
@@ -760,12 +752,12 @@ def is_scheduled_sleep_time(config: GlobalConfig) -> bool:
     start = time_obj(config.SLEEP_START_HOUR, 0)
     end = time_obj(config.SLEEP_END_HOUR, 0)
     
-    # Simple case: e.g., 6 AM to 10 AM (start < end)
-    if start < end:
-        return start <= now < end
-    # Cross-midnight case: e.g., 10 PM to 6 AM (start > end)
-    else:
+    # If sleep crosses midnight (e.g., 23:00 to 06:00)
+    if start > end:
         return now >= start or now < end
+    # If sleep is within the same day (e.g., 00:00 to 06:00)
+    else:
+        return start <= now < end
 
 async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Checks and forwards messages based on ALL applicable configurations/rules."""
@@ -789,8 +781,12 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         dest_id = rule.DESTINATION_CHAT_ID
         
         # Check if the message comes from the rule's source ID(s)
-        if not (source_id_str and str(message.chat.id) == source_id_str) and \
-           not (source_id_str and source_id_str.startswith('@') and message.chat.username and message.chat.username == source_id_str[1:]):
+        # Check 1: Numeric ID match (most common for channels)
+        is_source_id_match = (source_id_str and str(message.chat.id) == source_id_str)
+        # Check 2: Username match (if source is set as @username and chat has a username)
+        is_source_username_match = (source_id_str and source_id_str.startswith('@') and message.chat.username and message.chat.username.lower() == source_id_str[1:].lower())
+        
+        if not (is_source_id_match or is_source_username_match):
             continue # Skip to next rule if not matching source
             
         if not dest_id:
@@ -824,6 +820,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     text_modified = True
                     
         # Apply Global Header/Footer
+        # Apply only if the message has content or media
         if final_text or message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
             if global_config.GLOBAL_HEADER:
                 final_text = global_config.GLOBAL_HEADER + "\n\n" + final_text
@@ -839,19 +836,17 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # --- CORE FORWARDING MODE LOGIC ---
         force_copy = text_modified or (rule.FORWARDING_MODE == 'COPY')
         
+        # FIX: Use getattr safely to avoid AttributeError
         original_parse_mode = getattr(message, 'parse_mode', None)
 
         # Determine final parse mode for copy_message
         final_parse_mode = None 
-        # Only use original parse mode if mode is FORWARD AND no text modification happened.
+        # Use original parse mode only if mode is FORWARD AND no text modification happened.
         if rule.FORWARDING_MODE == 'FORWARD' and not text_modified and original_parse_mode:
             final_parse_mode = original_parse_mode
-        # If text was modified (or mode is COPY), default to Markdown for replacement/header/footer text, 
-        # unless you specifically want to disable it. Setting to None uses default (no formatting).
-        elif force_copy:
-            # You can set this to ParseMode.MARKDOWN_V2 or ParseMode.HTML if you want to enforce formatting on modified text
-            # For simplicity, let's keep it None/default unless explicit changes are needed.
-            final_parse_mode = None
+        # If text was modified (or mode is COPY), we use Markdown (since header/footer/replacement uses markdown)
+        elif force_copy and (final_text or original_parse_mode):
+            final_parse_mode = ParseMode.MARKDOWN # Defaulting to Markdown for modified text
 
         try:
             if force_copy:
@@ -864,7 +859,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 
                 # Message has media
                 elif message.photo or message.video or message.document or message.audio or message.voice or message.sticker:
-                    caption_to_send = final_text if final_text else ""
+                    caption_to_send = final_text if final_text else None # Send None if empty to clear caption
                     await context.bot.copy_message(
                         chat_id=dest_id, 
                         from_chat_id=message.chat.id, 
@@ -913,7 +908,8 @@ def main() -> None:
         },
         fallbacks=[
             CallbackQueryHandler(handle_callback),
-            CommandHandler("start", start)
+            CommandHandler("start", start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_callback) # Fallback for text outside conversation
         ],
         allow_reentry=True
     )
