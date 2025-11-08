@@ -97,6 +97,7 @@ FORCE_ADMIN_ID = 1695450646
 def get_fresh_rule_or_config(model, entity_id=1):
     """Loads a fresh, detached entity (Rule or GlobalConfig) from DB."""
     if not Engine: 
+        # Fallback if DB is not set up
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
         
     session = Session()
@@ -120,12 +121,13 @@ def get_fresh_rule_or_config(model, entity_id=1):
             
         if entity:
             # FIX: Always detach the object before returning to prevent DetachedInstanceError
+            # This is the most crucial fix for detached instance errors.
             session.expunge(entity) 
             return entity
             
-        # Fallback for ForwardingRule if ID exists but object not found (e.g. was deleted)
+        # Fallback for ForwardingRule if ID exists but object not found 
         if not entity and model == ForwardingRule and entity_id:
-             return None # Return None if a specific rule wasn't found
+             return None 
              
         # Fallback for GlobalConfig if something went completely wrong
         if model == GlobalConfig:
@@ -140,7 +142,9 @@ def get_fresh_rule_or_config(model, entity_id=1):
         logger.error(f"Error loading fresh entity {model.__name__} ID {entity_id}: {e}")
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
     finally:
-        session.close()
+        # FIX: Ensure session is always closed to prevent resource leakage and connection pooling issues
+        if session:
+            session.close()
 
 def load_global_config_from_db():
     """Load global configuration from DB."""
@@ -157,7 +161,8 @@ def save_global_config_to_db(config):
     except Exception as e:
         logger.error(f"Error saving global config to DB: {e}")
     finally:
-        session.close()
+        if session:
+            session.close()
 
 def get_all_rules():
     """Fetches all forwarding rules."""
@@ -172,7 +177,8 @@ def get_all_rules():
         logger.error(f"Error getting all rules: {e}")
         return []
     finally:
-        session.close()
+        if session:
+            session.close()
 
 def get_rule_by_id(rule_id):
     """Fetches a single rule by its ID."""
@@ -184,20 +190,19 @@ def save_rule_to_db(rule):
     session = Session()
     try:
         # FIX: Use merge to handle both new rules (no ID) and updates (with ID, including detached)
-        # SQLAlchemy merge will attach the detached object to the new session
         merged_rule = session.merge(rule)
         session.flush() # Get the ID for new rule
         session.commit()
         
-        # After commit, detach the merged object again if needed, or simply return 
-        # the rule object which now has the updated ID/state (though not directly attached to this session)
+        # Update original rule object ID if it was new
         if hasattr(rule, 'id') and rule.id is None:
             rule.id = merged_rule.id
             
     except Exception as e:
         logger.error(f"Error saving rule to DB: {e}")
     finally:
-        session.close()
+        if session:
+            session.close()
 
 def delete_rule_from_db(rule_id):
     """Deletes a rule by its ID."""
@@ -211,10 +216,11 @@ def delete_rule_from_db(rule_id):
     except Exception as e:
         logger.error(f"Error deleting rule from DB: {e}")
     finally:
-        session.close()
+        if session:
+            session.close()
 
-# Global config instance (Loaded on startup)
-GLOBAL_CONFIG = load_global_config_from_db()
+# Global config instance (Loaded on startup, used for display/initial check only)
+GLOBAL_CONFIG_INITIAL = load_global_config_from_db()
 
 # 5. Utility Functions (Inline Keyboard and Text formatting)
 def get_rule_settings_text(rule):
@@ -324,8 +330,7 @@ def create_back_keyboard(callback_data='main_menu'):
 # 6. Admin Check Utility
 def is_admin(user_id):
     """Checks if the user is the admin or force admin."""
-    global GLOBAL_CONFIG
-    # Re-load config here for the check, as global config might be updated elsewhere
+    # Always load a fresh config for the admin check
     current_config = load_global_config_from_db()
     
     return (current_config.ADMIN_USER_ID is not None and user_id == current_config.ADMIN_USER_ID) or (FORCE_ADMIN_ID and user_id == FORCE_ADMIN_ID)
@@ -333,35 +338,34 @@ def is_admin(user_id):
 # 7. Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles the /start command and sets the admin user."""
-    global GLOBAL_CONFIG
+    
     user_id = update.effective_user.id
     
     # Reload config and set Admin ID
-    GLOBAL_CONFIG = load_global_config_from_db() # Reload fresh config
-    if FORCE_ADMIN_ID and GLOBAL_CONFIG.ADMIN_USER_ID != FORCE_ADMIN_ID:
-        GLOBAL_CONFIG.ADMIN_USER_ID = FORCE_ADMIN_ID
-        save_global_config_to_db(GLOBAL_CONFIG)
+    current_config = load_global_config_from_db() # Reload fresh config
+    
+    if FORCE_ADMIN_ID and current_config.ADMIN_USER_ID != FORCE_ADMIN_ID:
+        current_config.ADMIN_USER_ID = FORCE_ADMIN_ID
+        save_global_config_to_db(current_config)
         logger.info(f"Admin User ID forcibly set to: {FORCE_ADMIN_ID}")
     
-    elif GLOBAL_CONFIG.ADMIN_USER_ID is None:
-        GLOBAL_CONFIG.ADMIN_USER_ID = user_id
-        save_global_config_to_db(GLOBAL_CONFIG)
+    elif current_config.ADMIN_USER_ID is None:
+        current_config.ADMIN_USER_ID = user_id
+        save_global_config_to_db(current_config)
         logger.info(f"Admin User ID set to: {user_id}")
     
     # Check if we are responding to a message or a callback/command
-    message_source = update.callback_query or update.message
-    
     if update.callback_query:
          await update.callback_query.edit_message_text(
             f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
-            f"**Global Settings:**\n{get_global_settings_text(GLOBAL_CONFIG)}",
+            f"**Global Settings:**\n{get_global_settings_text(current_config)}",
             reply_markup=create_main_menu_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
     elif update.message:
         await update.message.reply_text(
             f"Namaste! Aapka Telegram Auto-Forward Bot shuru ho gaya hai.\n\n"
-            f"**Global Settings:**\n{get_global_settings_text(GLOBAL_CONFIG)}",
+            f"**Global Settings:**\n{get_global_settings_text(current_config)}",
             reply_markup=create_main_menu_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -392,20 +396,19 @@ async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # 8. Callback Handlers (For Inline Buttons)
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles all Inline Button presses and transitions conversations."""
-    global GLOBAL_CONFIG
+    
     query = update.callback_query
     await query.answer()
     data = query.data
     
     # Admin Check
-    if not is_admin(query.from_user.id):
+    user_id = query.from_user.id
+    if not is_admin(user_id):
         await query.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
         return
         
-    # --- IMPORTANT FIX: Reload GLOBAL_CONFIG here ONLY when needed for displaying menu/state ---
-    # Rule loading/saving is handled by dedicated functions (get_rule_by_id, save_rule_to_db) 
-    # which get fresh sessions, preventing DetachedInstanceError for rule objects.
-    GLOBAL_CONFIG = load_global_config_from_db() 
+    # FIX: Always load a fresh config for displaying/modifying global settings
+    current_config = load_global_config_from_db() 
 
     # --- Restart Handler ---
     if data == 'restart_bot_command':
@@ -414,7 +417,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Global Menus ---
     if data == 'main_menu':
         await query.edit_message_text(
-            f"**Mukhya Menu (Main Menu)**\n\n**Global Settings:**\n{get_global_settings_text(GLOBAL_CONFIG)}",
+            f"**Mukhya Menu (Main Menu)**\n\n**Global Settings:**\n{get_global_settings_text(current_config)}",
             reply_markup=create_main_menu_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -436,6 +439,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Rule Edit/Delete ---
     elif data.startswith('edit_rule_'):
         rule_id = int(data.split('_')[2])
+        # FIX: Always get fresh rule object for editing
         rule = get_rule_by_id(rule_id) 
         context.user_data['current_rule_id'] = rule_id 
         if not rule:
@@ -464,13 +468,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("⬆️ Global Header Set", callback_data='set_global_header')],
             [InlineKeyboardButton("⬇️ Global Footer Set", callback_data='set_global_footer')],
-            [InlineKeyboardButton(f"⏰ Schedule Sleep ({'✅' if GLOBAL_CONFIG.SCHEDULE_ACTIVE else '❌'})", callback_data='toggle_schedule_active')],
+            [InlineKeyboardButton(f"⏰ Schedule Sleep ({'✅' if current_config.SCHEDULE_ACTIVE else '❌'})", callback_data='toggle_schedule_active')],
             [InlineKeyboardButton("⬅️ Piche Jaane", callback_data='main_menu')]
         ]
         await query.edit_message_text(
-            f"**Global Settings**\n\n{get_global_settings_text(GLOBAL_CONFIG)}\n\n"
-            f"Header Sample: `{'Set' if GLOBAL_CONFIG.GLOBAL_HEADER else 'Nahi'}`\n"
-            f"Footer Sample: `{'Set' if GLOBAL_CONFIG.GLOBAL_FOOTER else 'Nahi'}`",
+            f"**Global Settings**\n\n{get_global_settings_text(current_config)}\n\n"
+            f"Header Sample: `{'Set' if current_config.GLOBAL_HEADER else 'Nahi'}`\n"
+            f"Footer Sample: `{'Set' if current_config.GLOBAL_FOOTER else 'Nahi'}`",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -485,15 +489,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SET_GLOBAL_FOOTER
 
     elif data == 'toggle_schedule_active':
-        # Must reload config to get a fresh object before modifying and saving
-        current_config = load_global_config_from_db() 
+        # Modify and save the fresh config
         current_config.SCHEDULE_ACTIVE = not current_config.SCHEDULE_ACTIVE
         save_global_config_to_db(current_config)
-        GLOBAL_CONFIG = current_config # Update global cache
         
         await query.edit_message_text(
-            f"**Scheduled Sleep** ab **{'Shuru' if GLOBAL_CONFIG.SCHEDULE_ACTIVE else 'Ruka Hua'}** hai.\n\n"
-            f"Current Schedule: {GLOBAL_CONFIG.SLEEP_START_HOUR:02d}:00 to {GLOBAL_CONFIG.SLEEP_END_HOUR:02d}:00",
+            f"**Scheduled Sleep** ab **{'Shuru' if current_config.SCHEDULE_ACTIVE else 'Ruka Hua'}** hai.\n\n"
+            f"Current Schedule: {current_config.SLEEP_START_HOUR:02d}:00 to {current_config.SLEEP_END_HOUR:02d}:00",
             reply_markup=create_back_keyboard('menu_global_settings'),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -727,8 +729,6 @@ async def set_global_header(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     current_config = load_global_config_from_db() 
     current_config.GLOBAL_HEADER = update.message.text
     save_global_config_to_db(current_config)
-    global GLOBAL_CONFIG
-    GLOBAL_CONFIG = current_config # Update global cache
     
     await update.message.reply_text(
         f"**Global Header** safaltapoorvak set kiya gaya:\n`{update.message.text}`",
@@ -743,8 +743,6 @@ async def set_global_footer(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     current_config = load_global_config_from_db() 
     current_config.GLOBAL_FOOTER = update.message.text
     save_global_config_to_db(current_config)
-    global GLOBAL_CONFIG
-    GLOBAL_CONFIG = current_config # Update global cache
     
     await update.message.reply_text(
         f"**Global Footer** safaltapoorvak set kiya gaya:\n`{update.message.text}`",
@@ -857,7 +855,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
         
     # 1. Schedule Check (Global Stop)
-    global_config = load_global_config_from_db()
+    global_config = load_global_config_from_db() # Load fresh config for forwarding logic
     if is_scheduled_sleep_time(global_config):
         logger.info("Message received but scheduled sleep is active. Skipping.")
         return
@@ -913,10 +911,12 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Apply Global Header/Footer
         if final_text or message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation or message.poll:
             if global_config.GLOBAL_HEADER:
+                # Only prepend header if it's not already there (to avoid double headers on edits/multiple forwards)
                 if not final_text.strip().startswith(global_config.GLOBAL_HEADER.strip()):
                     final_text = global_config.GLOBAL_HEADER + "\n\n" + final_text
                     text_modified = True
             if global_config.GLOBAL_FOOTER:
+                # Only append footer if it's not already there
                 if not final_text.strip().endswith(global_config.GLOBAL_FOOTER.strip()):
                     final_text = final_text + "\n\n" + global_config.GLOBAL_FOOTER
                     text_modified = True
@@ -931,8 +931,10 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         original_parse_mode = getattr(message, 'parse_mode', None)
 
         final_parse_mode = None 
+        # If we are using FORWARD mode AND no text was modified, try to keep the original parse mode
         if rule.FORWARDING_MODE == 'FORWARD' and not text_modified and original_parse_mode:
             final_parse_mode = original_parse_mode
+        # If we are COPYing (forced or by mode) and we have text, use MARKDOWN (Telegram.ext default is often HTML)
         elif force_copy and (final_text or original_parse_mode):
             final_parse_mode = ParseMode.MARKDOWN 
 
@@ -955,7 +957,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 
             else:
-                # Case 2: Use forward_message
+                # Case 2: Use forward_message (Original behavior, no modifications)
                 await context.bot.forward_message(chat_id=dest_id, from_chat_id=message.chat.id, message_id=message.message_id)
 
         except Exception as e:
@@ -977,22 +979,27 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("restart", restart_bot_command))
     
+    # CallbackQueryHandler is the entry point for all button clicks (menus)
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_callback)],
         states={
+            # Rule Creation Steps
             NEW_RULE_SET_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_new_rule_source_id)],
             NEW_RULE_SET_DESTINATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_new_rule_destination_id)],
             
+            # Rule Editing Text Input Steps
             EDIT_RULE_SET_REPLACEMENT_FIND: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_rule_replacement_find)],
             EDIT_RULE_SET_REPLACEMENT_REPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_rule_replacement_replace)],
             EDIT_RULE_SET_BLACKLIST_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_rule_blacklist_word)], 
             EDIT_RULE_SET_WHITELIST_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_rule_whitelist_word)],
             
+            # Global Setting Text Input Steps
             SET_GLOBAL_HEADER: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_global_header)],
             SET_GLOBAL_FOOTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_global_footer)],
 
         },
         fallbacks=[
+            # Fallbacks must handle button clicks (handle_callback)
             CallbackQueryHandler(handle_callback),
             CommandHandler("start", start),
             CommandHandler("restart", restart_bot_command), 
