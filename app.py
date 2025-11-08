@@ -763,6 +763,10 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Checks and forwards messages based on ALL applicable configurations/rules."""
     message = update.channel_post or update.message
     
+    # Ignore messages from the Admin (to prevent bot feedback loops)
+    if message and message.chat.type == 'private' and is_admin(message.chat.id):
+        return
+        
     # 1. Schedule Check (Global Stop)
     global_config = load_global_config_from_db()
     if is_scheduled_sleep_time(global_config):
@@ -875,7 +879,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             logger.error(f"Error processing message for Rule {rule.id}: {e}")
             
-# 11. Main Function 
+# 11. Main Function (FIXED: Removed duplicate CallbackQueryHandler)
 def main() -> None:
     """Start the bot."""
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -886,7 +890,7 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
     
     # ----------------------------------------------------------------------
-    # Conversation Handler Setup (Updated for new states)
+    # Conversation Handler Setup
     # ----------------------------------------------------------------------
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_callback)],
@@ -909,17 +913,17 @@ def main() -> None:
         fallbacks=[
             CallbackQueryHandler(handle_callback),
             CommandHandler("start", start),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_callback) # Fallback for text outside conversation
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_callback) 
         ],
         allow_reentry=True
     )
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    # application.add_handler(CallbackQueryHandler(handle_callback)) <--- यह लाइन हटा दी गई है।
     
     # Message handler for forwarding logic (must be last)
-    application.add_handler(MessageHandler(filters.ALL, forward_message))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.EDITED_CHANNEL_POST, forward_message))
     
     # Webhook Setup for Render/Deployment
     PORT = int(os.environ.get("PORT", "8080")) 
