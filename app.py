@@ -110,18 +110,15 @@ def get_fresh_rule_or_config(model, entity_id=1):
                 entity = GlobalConfig(id=1)
                 session.add(entity)
                 session.commit()
-                # Ensure new fields exist for compatibility
-                if not hasattr(entity, 'GLOBAL_HEADER') or entity.GLOBAL_HEADER is None: entity.GLOBAL_HEADER = ''
-                if not hasattr(entity, 'GLOBAL_FOOTER') or entity.GLOBAL_FOOTER is None: entity.GLOBAL_FOOTER = ''
-                if not hasattr(entity, 'SCHEDULE_ACTIVE'): entity.SCHEDULE_ACTIVE = False
+                # Reload the created entity right after commit
+                entity = session.query(GlobalConfig).filter(GlobalConfig.id == entity_id).first()
                 logger.info("New GlobalConfig entry created in DB.")
             
         elif model == ForwardingRule:
             entity = session.query(ForwardingRule).filter(ForwardingRule.id == entity_id).first()
             
         if entity:
-            # FIX: Always detach the object before returning to prevent DetachedInstanceError
-            # This is the most crucial fix for detached instance errors.
+            # CRITICAL FIX: Always detach the object using expunge before returning
             session.expunge(entity) 
             return entity
             
@@ -131,31 +128,32 @@ def get_fresh_rule_or_config(model, entity_id=1):
              
         # Fallback for GlobalConfig if something went completely wrong
         if model == GlobalConfig:
+             # Return a default detached instance
              return GlobalConfig(id=1, ADMIN_USER_ID=None)
              
         return entity
         
-    except ObjectNotExecutableError:
-        logger.warning(f"SQLAlchemy query failed for {model.__name__} ID {entity_id}. Returning None.")
-        return None
     except Exception as e:
-        logger.error(f"Error loading fresh entity {model.__name__} ID {entity_id}: {e}")
+        # Catch all errors (including ObjectNotExecutableError) and log them
+        logger.error(f"Error loading fresh entity {model.__name__} ID {entity_id} during operation: {e}")
+        # Return a safe fallback object
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
     finally:
-        # FIX: Ensure session is always closed to prevent resource leakage and connection pooling issues
+        # CRITICAL FIX: Ensure session is always closed
         if session:
             session.close()
 
 def load_global_config_from_db():
     """Load global configuration from DB."""
+    # Returns a fresh, detached object (GlobalConfig)
     return get_fresh_rule_or_config(GlobalConfig)
 
 def save_global_config_to_db(config):
-    """Save the provided global configuration object back to the database."""
+    """Save the provided detached global configuration object back to the database."""
     if not Engine: return
     session = Session()
     try:
-        # Use merge for consistency and handling detached instances
+        # CRITICAL FIX: Use merge to handle the detached instance
         session.merge(config)
         session.commit()
     except Exception as e:
@@ -170,7 +168,7 @@ def get_all_rules():
     session = Session()
     try:
         rules = session.query(ForwardingRule).all()
-        # Detach objects from session
+        # Detach objects from session before returning
         [session.expunge(rule) for rule in rules]
         return rules
     except Exception as e:
@@ -182,14 +180,15 @@ def get_all_rules():
 
 def get_rule_by_id(rule_id):
     """Fetches a single rule by its ID."""
+    # Returns a fresh, detached object (ForwardingRule)
     return get_fresh_rule_or_config(ForwardingRule, rule_id)
 
 def save_rule_to_db(rule):
-    """Saves or updates a single rule."""
+    """Saves or updates a single rule (which is detached)."""
     if not Engine: return
     session = Session()
     try:
-        # FIX: Use merge to handle both new rules (no ID) and updates (with ID, including detached)
+        # CRITICAL FIX: Use merge to handle both new rules (no ID) and updates (with ID, including detached)
         merged_rule = session.merge(rule)
         session.flush() # Get the ID for new rule
         session.commit()
@@ -209,6 +208,7 @@ def delete_rule_from_db(rule_id):
     if not Engine: return
     session = Session()
     try:
+        # We query inside this function to attach it to the current session before deleting
         rule = session.query(ForwardingRule).filter(ForwardingRule.id == rule_id).first()
         if rule:
             session.delete(rule)
@@ -506,7 +506,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split('_')
     if len(parts) > 2 and parts[-1].isdigit():
         rule_id = int(parts[-1])
-        # MUST load rule from DB just before modifying
+        # MUST load fresh rule from DB just before modifying
         rule = get_rule_by_id(rule_id) 
         if not rule:
             await query.edit_message_text("Rule ID galat hai.", reply_markup=create_back_keyboard('manage_rules'))
