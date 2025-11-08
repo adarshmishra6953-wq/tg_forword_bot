@@ -91,7 +91,6 @@ if Engine:
         logger.error(f"Database connection error during table creation: {e}")
 
 # Example: Use your actual Telegram User ID here to force admin status
-# NOTE: This ID is taken from the user's previous context which should be your ID.
 FORCE_ADMIN_ID = 1695450646 
 
 # 4. Configuration Management Functions
@@ -101,6 +100,7 @@ def get_fresh_rule_or_config(model, entity_id=1):
         return GlobalConfig(id=1, ADMIN_USER_ID=None) if model == GlobalConfig else None
         
     session = Session()
+    entity = None
     try:
         if model == GlobalConfig:
             entity = session.query(GlobalConfig).filter(GlobalConfig.id == entity_id).first()
@@ -108,17 +108,17 @@ def get_fresh_rule_or_config(model, entity_id=1):
                 entity = GlobalConfig(id=1)
                 session.add(entity)
                 session.commit()
+                # Ensure new fields exist for compatibility
+                if not hasattr(entity, 'GLOBAL_HEADER') or entity.GLOBAL_HEADER is None: entity.GLOBAL_HEADER = ''
+                if not hasattr(entity, 'GLOBAL_FOOTER') or entity.GLOBAL_FOOTER is None: entity.GLOBAL_FOOTER = ''
+                if not hasattr(entity, 'SCHEDULE_ACTIVE'): entity.SCHEDULE_ACTIVE = False
                 logger.info("New GlobalConfig entry created in DB.")
-            
-            # Ensure new fields exist for compatibility
-            if not hasattr(entity, 'GLOBAL_HEADER') or entity.GLOBAL_HEADER is None: entity.GLOBAL_HEADER = ''
-            if not hasattr(entity, 'GLOBAL_FOOTER') or entity.GLOBAL_FOOTER is None: entity.GLOBAL_FOOTER = ''
-            if not hasattr(entity, 'SCHEDULE_ACTIVE'): entity.SCHEDULE_ACTIVE = False
             
         elif model == ForwardingRule:
             entity = session.query(ForwardingRule).filter(ForwardingRule.id == entity_id).first()
             
-        session.expunge(entity) # Detach object before returning
+        if entity:
+            session.expunge(entity) # Detach object before returning
         return entity
     except Exception as e:
         logger.error(f"Error loading fresh entity {model.__name__} ID {entity_id}: {e}")
@@ -128,7 +128,6 @@ def get_fresh_rule_or_config(model, entity_id=1):
 
 def load_global_config_from_db():
     """Load global configuration from DB."""
-    # FIX 1: Load a fresh config object
     return get_fresh_rule_or_config(GlobalConfig)
 
 def save_global_config_to_db(config):
@@ -136,12 +135,8 @@ def save_global_config_to_db(config):
     if not Engine: return
     session = Session()
     try:
-        # Load fresh object and update its attributes from the detached 'config' object
-        fresh_config = session.query(GlobalConfig).filter(GlobalConfig.id == config.id).one()
-        for attr, value in config.__dict__.items():
-            if not attr.startswith('_'): # Skip internal attributes
-                setattr(fresh_config, attr, value)
-        
+        # Use merge for consistency and handling detached instances
+        session.merge(config)
         session.commit()
     except Exception as e:
         logger.error(f"Error saving global config to DB: {e}")
@@ -165,7 +160,6 @@ def get_all_rules():
 
 def get_rule_by_id(rule_id):
     """Fetches a single rule by its ID."""
-    # FIX 1: Load a fresh rule object
     return get_fresh_rule_or_config(ForwardingRule, rule_id)
 
 def save_rule_to_db(rule):
@@ -173,12 +167,16 @@ def save_rule_to_db(rule):
     if not Engine: return
     session = Session()
     try:
-        # Load fresh rule object and update its attributes from the detached 'rule' object
-        fresh_rule = session.query(ForwardingRule).filter(ForwardingRule.id == rule.id).one()
-        for attr, value in rule.__dict__.items():
-            if not attr.startswith('_'): # Skip internal attributes
-                setattr(fresh_rule, attr, value)
-                
+        # FIX 1: Use merge to handle both new rules (no ID) and updates (with ID)
+        if rule.id is None:
+            # New rule
+            session.add(rule)
+        else:
+            # Existing rule update (merge handles detached instance error)
+            session.merge(rule)
+            
+        session.flush() # Get the ID for new rule
+        session.expunge(rule) # Detach it from session after update
         session.commit()
     except Exception as e:
         logger.error(f"Error saving rule to DB: {e}")
@@ -349,7 +347,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
         return
 
-    GLOBAL_CONFIG = load_global_config_from_db() # Reload global config
+    # Reload global config to get fresh object
+    GLOBAL_CONFIG = load_global_config_from_db() 
 
     # --- Global Menus ---
     if data == 'main_menu':
@@ -369,14 +368,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
         
     elif data == 'new_rule':
+        # Initialize a new rule object for conversation data
+        context.user_data['new_rule'] = ForwardingRule() 
         await query.edit_message_text("Kripya **Naye Rule** ke liye Source Channel ka **ID** ya **Username** bhejein.", reply_markup=create_back_keyboard('manage_rules'))
         return NEW_RULE_SET_SOURCE
         
     # --- Rule Edit/Delete ---
     elif data.startswith('edit_rule_'):
         rule_id = int(data.split('_')[2])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
-        context.user_data['current_rule_id'] = rule_id # Store ID for ConversationHandler
+        rule = get_rule_by_id(rule_id) 
+        context.user_data['current_rule_id'] = rule_id 
         if not rule:
             await query.edit_message_text("Rule maujood nahi hai.", reply_markup=create_back_keyboard('manage_rules'))
             return ConversationHandler.END
@@ -424,7 +425,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SET_GLOBAL_FOOTER
 
     elif data == 'toggle_schedule_active':
-        GLOBAL_CONFIG = load_global_config_from_db() # FIX 1: Load fresh object before modifying
+        GLOBAL_CONFIG = load_global_config_from_db() 
         GLOBAL_CONFIG.SCHEDULE_ACTIVE = not GLOBAL_CONFIG.SCHEDULE_ACTIVE
         save_global_config_to_db(GLOBAL_CONFIG)
         
@@ -441,7 +442,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split('_')
     if len(parts) > 2 and parts[-1].isdigit():
         rule_id = int(parts[-1])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         if not rule:
             await query.edit_message_text("Rule ID galat hai.", reply_markup=create_back_keyboard('manage_rules'))
             return ConversationHandler.END
@@ -466,7 +467,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('menu_schedule_'):
         rule_id = int(data.split('_')[2])
         context.user_data['current_rule_id'] = rule_id
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         keyboard = [
             [InlineKeyboardButton("0 Sec (Default)", callback_data=f'set_delay_0_{rule_id}'), InlineKeyboardButton("5 Sec", callback_data=f'set_delay_5_{rule_id}')],
             [InlineKeyboardButton("15 Sec", callback_data=f'set_delay_15_{rule_id}'), InlineKeyboardButton("30 Sec", callback_data=f'set_delay_30_{rule_id}')],
@@ -480,7 +481,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split('_')
         delay = int(parts[2])
         rule_id = int(parts[3])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         rule.FORWARD_DELAY_SECONDS = delay
         save_rule_to_db(rule)
         await query.edit_message_text(
@@ -493,7 +494,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Forwarding Mode Menu (Rule Specific)
     elif data.startswith('menu_forwarding_mode_'):
         rule_id = int(data.split('_')[3])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         keyboard = [
             [InlineKeyboardButton(f"1. Forward (Original) {'✅' if rule.FORWARDING_MODE == 'FORWARD' else '❌'}", callback_data=f'set_mode_forward_{rule_id}')],
             [InlineKeyboardButton(f"2. Copy (Caption Editing) {'✅' if rule.FORWARDING_MODE == 'COPY' else '❌'}", callback_data=f'set_mode_copy_{rule_id}')],
@@ -506,7 +507,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split('_')
         mode = parts[2].upper()
         rule_id = int(parts[3])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         rule.FORWARDING_MODE = mode
         save_rule_to_db(rule)
         await query.edit_message_text(
@@ -521,7 +522,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('menu_blacklist_'):
         rule_id = int(data.split('_')[2])
         context.user_data['current_rule_id'] = rule_id
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Shabdh Blacklist Karein", callback_data=f'add_blacklist_word_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Blacklist Hatayein", callback_data=f'clear_blacklist_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
         await query.edit_message_text(f"**Rule {rule_id} Blacklist Settings**\n\nCurrent Blacklisted Words: {', '.join(rule.WORD_BLACKLIST or []) or 'Koi nahi'}", reply_markup=InlineKeyboardMarkup(keyboard))
         return ConversationHandler.END
@@ -534,7 +535,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith('clear_blacklist_'):
         rule_id = int(data.split('_')[2])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         rule.WORD_BLACKLIST = []
         save_rule_to_db(rule)
         await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Blacklisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
@@ -544,7 +545,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('menu_whitelist_'):
         rule_id = int(data.split('_')[2])
         context.user_data['current_rule_id'] = rule_id
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Shabdh Whitelist Karein", callback_data=f'add_whitelist_word_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Whitelist Hatayein", callback_data=f'clear_whitelist_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
         await query.edit_message_text(f"**Rule {rule_id} Whitelist Settings**\n\nCurrent Whitelisted Words: {', '.join(rule.WORD_WHITELIST or []) or 'Koi nahi'} (Inka hona jaruri hai)", reply_markup=InlineKeyboardMarkup(keyboard))
         return ConversationHandler.END
@@ -557,7 +558,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith('clear_whitelist_'):
         rule_id = int(data.split('_')[2])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         rule.WORD_WHITELIST = []
         save_rule_to_db(rule)
         await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Whitelisted Shabdh** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
@@ -567,7 +568,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('menu_replacement_'):
         rule_id = int(data.split('_')[2])
         context.user_data['current_rule_id'] = rule_id
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         keyboard = [[InlineKeyboardButton("➕ Naya Niyam Jodein", callback_data=f'add_replacement_find_{rule_id}')], [InlineKeyboardButton("🗑️ Saare Niyam Hatayein", callback_data=f'clear_replacements_{rule_id}')], [InlineKeyboardButton("⬅️ Rule Edit", callback_data=f'edit_rule_{rule_id}')]]
         await query.edit_message_text(f"**Rule {rule_id} Text Replacement Niyam**\n\n{get_rule_settings_text(rule)}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
@@ -580,44 +581,50 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith('clear_replacements_'):
         rule_id = int(data.split('_')[2])
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         rule.TEXT_REPLACEMENTS = {}
         save_rule_to_db(rule)
         await query.edit_message_text(f"**Rule {rule_id}** ke **Saare Replacement Niyam** hata diye gaye hain.", reply_markup=create_back_keyboard(f'edit_rule_{rule_id}'))
         return ConversationHandler.END
 
-    return ConversationHandler.END # End the conversation if the callback is handled
+    return ConversationHandler.END 
 
 
 # 9. Conversation Handlers (For User Input)
 
 async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, config_attr: str, new_rule: bool) -> int:
     """Utility function to handle receiving chat ID/Username for a rule."""
+    # FIX 2: Admin check added directly to the conversation handler logic
     if not is_admin(update.message.chat_id):
-        await update.message.reply_text("Aap Bot ke Admin nahi hain.")
+        await update.message.reply_text("Aap Bot ke Admin nahi hain. Sirf Admin hi settings badal sakta hai.")
         return ConversationHandler.END
 
     chat_input = update.message.text.strip()
+    
+    # Validation
     if not (chat_input.startswith('-100') or chat_input.startswith('@') or chat_input.isdigit()):
-         # If new rule, go back to manage_rules, if edit, go back to rule edit
          fallback_data = 'manage_rules' if new_rule else f'edit_rule_{context.user_data.get("current_rule_id")}'
          await update.message.reply_text("Galat format! Kripya ID (-100...) ya Username (@...) bhejein.", reply_markup=create_back_keyboard(fallback_data))
          return ConversationHandler.END
 
     if new_rule:
         # For new rule creation
-        if 'new_rule' not in context.user_data:
-            context.user_data['new_rule'] = ForwardingRule()
-        setattr(context.user_data['new_rule'], config_attr, chat_input)
+        new_rule_obj = context.user_data.get('new_rule')
+        if not new_rule_obj:
+            new_rule_obj = ForwardingRule()
+            context.user_data['new_rule'] = new_rule_obj # Re-initialize if lost
+            
+        setattr(new_rule_obj, config_attr, chat_input)
         
         if config_attr == 'SOURCE_CHAT_ID':
             await update.message.reply_text("Ab Destination Channel ka **ID** ya **Username** bhejein.", reply_markup=create_back_keyboard('manage_rules'))
             return NEW_RULE_SET_DESTINATION
         
         elif config_attr == 'DESTINATION_CHAT_ID':
-            # Save the new rule to DB
-            new_rule_obj = context.user_data.pop('new_rule')
+            # Save the new rule to DB (FIX 1: Logic updated in save_rule_to_db)
             save_rule_to_db(new_rule_obj)
+            context.user_data.pop('new_rule', None)
+            
             await update.message.reply_text(
                 f"**Naya Rule** safaltapoorvak ban gaya hai (ID: `{new_rule_obj.id}`).\n"
                 f"Source: `{new_rule_obj.SOURCE_CHAT_ID}`\n"
@@ -630,7 +637,7 @@ async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         # For editing existing rule
         rule_id = context.user_data.get('current_rule_id')
-        rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+        rule = get_rule_by_id(rule_id) 
         if not rule:
             await update.message.reply_text("Rule ID lost/galat hai.", reply_markup=create_back_keyboard('manage_rules'))
             return ConversationHandler.END
@@ -655,7 +662,7 @@ async def set_new_rule_destination_id(update: Update, context: ContextTypes.DEFA
 async def set_global_header(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.message.chat_id): return ConversationHandler.END
     
-    GLOBAL_CONFIG = load_global_config_from_db() # FIX 1: Load fresh config
+    GLOBAL_CONFIG = load_global_config_from_db() 
     GLOBAL_CONFIG.GLOBAL_HEADER = update.message.text
     save_global_config_to_db(GLOBAL_CONFIG)
     await update.message.reply_text(
@@ -668,7 +675,7 @@ async def set_global_header(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def set_global_footer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.message.chat_id): return ConversationHandler.END
     
-    GLOBAL_CONFIG = load_global_config_from_db() # FIX 1: Load fresh config
+    GLOBAL_CONFIG = load_global_config_from_db() 
     GLOBAL_CONFIG.GLOBAL_FOOTER = update.message.text
     save_global_config_to_db(GLOBAL_CONFIG)
     await update.message.reply_text(
@@ -684,7 +691,7 @@ async def set_rule_list_word(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not is_admin(update.message.chat_id): return ConversationHandler.END
     
     rule_id = context.user_data.get('current_rule_id')
-    rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+    rule = get_rule_by_id(rule_id) 
     if not rule:
         await update.message.reply_text("Rule ID lost/galat hai.", reply_markup=create_back_keyboard('manage_rules'))
         return ConversationHandler.END
@@ -728,7 +735,7 @@ async def set_rule_replacement_replace(update: Update, context: ContextTypes.DEF
     if not is_admin(update.message.chat_id): return ConversationHandler.END
     
     rule_id = context.user_data.get('current_rule_id')
-    rule = get_rule_by_id(rule_id) # FIX 1: Load fresh rule
+    rule = get_rule_by_id(rule_id) 
     if not rule:
         await update.message.reply_text("Rule ID lost/galat hai.", reply_markup=create_back_keyboard('manage_rules'))
         return ConversationHandler.END
@@ -841,11 +848,15 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Apply only if the message has content or media
         if final_text or message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation or message.poll:
             if global_config.GLOBAL_HEADER:
-                final_text = global_config.GLOBAL_HEADER + "\n\n" + final_text
-                text_modified = True
+                # Add header only if it's not already at the start (basic check)
+                if not final_text.strip().startswith(global_config.GLOBAL_HEADER.strip()):
+                    final_text = global_config.GLOBAL_HEADER + "\n\n" + final_text
+                    text_modified = True
             if global_config.GLOBAL_FOOTER:
-                final_text = final_text + "\n\n" + global_config.GLOBAL_FOOTER
-                text_modified = True
+                # Add footer only if it's not already at the end (basic check)
+                if not final_text.strip().endswith(global_config.GLOBAL_FOOTER.strip()):
+                    final_text = final_text + "\n\n" + global_config.GLOBAL_FOOTER
+                    text_modified = True
 
         # Apply Delay (Rule Specific)
         if rule.FORWARD_DELAY_SECONDS > 0:
@@ -862,7 +873,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Use original parse mode only if mode is FORWARD AND no text modification happened.
         if rule.FORWARDING_MODE == 'FORWARD' and not text_modified and original_parse_mode:
             final_parse_mode = original_parse_mode
-        # If text was modified (or mode is COPY), we use Markdown (since header/footer/replacement uses markdown)
+        # If text was modified (or mode is COPY), we use Markdown 
         elif force_copy and (final_text or original_parse_mode):
             final_parse_mode = ParseMode.MARKDOWN # Defaulting to Markdown for modified text
 
@@ -873,6 +884,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 # Pure Text Message
                 if message.text and not message.caption:
                     if final_text and final_text.strip():
+                         # FIX 5: Added disable_web_page_preview
                          await context.bot.send_message(chat_id=dest_id, text=final_text, parse_mode=final_parse_mode, disable_web_page_preview=True)
                 
                 # Message has media
@@ -884,8 +896,6 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         message_id=message.message_id, 
                         caption=caption_to_send, 
                         parse_mode=final_parse_mode,
-                        # Added for polls, although copy_message might not fully support all options on all media types
-                        # The bot will handle the most common media types (photo/video/document)
                     )
                 
             else:
@@ -895,7 +905,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             logger.error(f"Error processing message for Rule {rule.id} to {dest_id}: {e}")
             
-# 11. Main Function (Already fixed in previous step)
+# 11. Main Function 
 def main() -> None:
     """Start the bot."""
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -929,7 +939,6 @@ def main() -> None:
         fallbacks=[
             CallbackQueryHandler(handle_callback),
             CommandHandler("start", start),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_callback) 
         ],
         allow_reentry=True
     )
