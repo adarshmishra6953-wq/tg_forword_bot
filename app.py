@@ -31,6 +31,7 @@ from telegram.ext import (
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, DateTime, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 
 # ------------------ Logging ------------------
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -69,9 +70,11 @@ class ForwardRule(Base):
     is_active = Column(Boolean, default=True)
     block_links = Column(Boolean, default=False)
     block_usernames = Column(Boolean, default=False)
-    blacklist_words = Column(PickleType, default=list)     # list[str]
-    whitelist_words = Column(PickleType, default=list)     # list[str]
-    text_replacements = Column(PickleType, default=dict)   # dict{find: replace}
+
+    # Use Mutable containers so sqlalchemy tracks in-place changes
+    blacklist_words = Column(MutableList.as_mutable(PickleType), default=list)     # list[str]
+    whitelist_words = Column(MutableList.as_mutable(PickleType), default=list)     # list[str]
+    text_replacements = Column(MutableDict.as_mutable(PickleType), default=dict)   # dict{find: replace}
 
     header_text = Column(String, nullable=True)
     footer_text = Column(String, nullable=True)
@@ -233,7 +236,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = update.effective_user
     if not admin_check(user.id):
-        await query.edit_message_text("Keval admin is bot ko use kar sakta hai.")
+        # avoid editing message if not authorized; send short notice
+        try:
+            await query.edit_message_text("Keval admin is bot ko use kar sakta hai.")
+        except Exception:
+            pass
         return
 
     data = query.data or ""
@@ -264,7 +271,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # open rule main
         if data.startswith("rule_open|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if not rule:
                 await query.edit_message_text("Rule nahi mila.")
                 return
@@ -274,7 +281,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # enable/disable
         if data.startswith("toggle_active|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.is_active = not rule.is_active
                 session.commit()
@@ -284,7 +291,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # delete rule
         if data.startswith("delete_rule|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 session.delete(rule)
                 session.commit()
@@ -301,7 +308,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # settings open
         if data.startswith("settings|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 await query.edit_message_text(format_rule_summary(rule), reply_markup=rule_settings_keyboard(rule), parse_mode="Markdown")
             return
@@ -309,7 +316,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # stats
         if data.startswith("stats|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 txt = f"Rule #{rule.id} Stats:\nForwarded Count: {rule.forwarded_count}\nLast Triggered: {rule.last_triggered or 'Never'}"
                 await query.edit_message_text(txt, reply_markup=rule_action_keyboard(rule))
@@ -318,7 +325,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # export
         if data.startswith("export_rule|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 payload = {
                     "id": rule.id,
@@ -345,7 +352,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # toggle links/usernames
         if data.startswith("toggle_links|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.block_links = not rule.block_links
                 session.commit()
@@ -354,7 +361,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("toggle_usernames|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.block_usernames = not rule.block_usernames
                 session.commit()
@@ -364,7 +371,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # toggle mode
         if data.startswith("set_mode|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.forward_mode = "COPY" if rule.forward_mode == "FORWARD" else "FORWARD"
                 session.commit()
@@ -389,7 +396,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # view replacements -> show list with delete buttons
         if data.startswith("view_replace|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if not rule:
                 await query.edit_message_text("Rule nahi mila.")
                 return
@@ -400,9 +407,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # build buttons: each replacement shows delete button
             buttons = []
             for find, repl in replacements.items():
-                # encode find key
                 key_enc = urllib.parse.quote_plus(find)
-                buttons.append([InlineKeyboardButton(f"'{find}' → '{repl}'", callback_data=f"noop")])
+                buttons.append([InlineKeyboardButton(f"'{find}' → '{repl}'", callback_data="noop")])
                 buttons.append([InlineKeyboardButton("❌ Delete", callback_data=f"del_replace|{rid}|{key_enc}")])
             buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"settings|{rid}")])
             await query.edit_message_text("Replacements (click Delete to remove):", reply_markup=InlineKeyboardMarkup(buttons))
@@ -412,11 +418,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("del_replace|"):
             _, rid, key_enc = data.split("|", 2)
             find = urllib.parse.unquote_plus(key_enc)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 replacements = rule.text_replacements or {}
                 if find in replacements:
                     replacements.pop(find)
+                    # assign back to ensure DB change tracked (MutableDict usually tracks but reassign to be safe)
                     rule.text_replacements = replacements
                     session.commit()
                     await query.edit_message_text(f"Replacement '{find}' deleted.", reply_markup=rule_settings_keyboard(rule))
@@ -434,7 +441,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # view blacklist with delete buttons
         if data.startswith("view_blacklist|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if not rule:
                 await query.edit_message_text("Rule nahi mila.")
                 return
@@ -455,7 +462,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("del_black|"):
             _, rid, w_enc = data.split("|", 2)
             word = urllib.parse.unquote_plus(w_enc)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 bl = rule.blacklist_words or []
                 if word in bl:
@@ -477,7 +484,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # view whitelist
         if data.startswith("view_whitelist|"):
             _, rid = data.split("|", 1)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if not rule:
                 await query.edit_message_text("Rule nahi mila.")
                 return
@@ -498,7 +505,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("del_white|"):
             _, rid, w_enc = data.split("|", 2)
             word = urllib.parse.unquote_plus(w_enc)
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 wl = rule.whitelist_words or []
                 if word in wl:
@@ -572,10 +579,14 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
             if "name" not in state:
                 state["name"] = text[:64]
+                # explicit initialize lists/dicts to avoid legacy None
                 rule = ForwardRule(
                     name=state["name"],
                     source_chat_id=state["source"],
                     destination_chat_id=state["dest"],
+                    blacklist_words=[],
+                    whitelist_words=[],
+                    text_replacements={},
                 )
                 session.add(rule)
                 session.commit()
@@ -586,7 +597,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # Edit name
         if "edit_name_rule" in context.user_data:
             rid = context.user_data.pop("edit_name_rule")
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.name = text[:64]
                 session.commit()
@@ -601,7 +612,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             except ValueError:
                 await update.message.reply_text("Please send an integer seconds value like 0,5,15,30,60")
                 return
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.forward_delay = max(0, val)
                 session.commit()
@@ -618,11 +629,12 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             rid = context.user_data.pop("add_replace_rule")
             find = context.user_data.pop("replace_find")
             repl = text
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 replacements = rule.text_replacements or {}
-                # ensure we can add multiple replacements without overwriting
+                # Add/overwrite the find key (multiple pairs supported)
                 replacements[find] = repl
+                # Reassign to ensure change detection (MutableDict often handles in-place, but reassign to be safe)
                 rule.text_replacements = replacements
                 session.commit()
                 await update.message.reply_text("Replacement saved.", reply_markup=rule_settings_keyboard(rule))
@@ -632,7 +644,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if "add_blacklist_rule" in context.user_data:
             rid = context.user_data.pop("add_blacklist_rule")
             word = text.lower().strip()
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 bl = rule.blacklist_words or []
                 if word not in bl:
@@ -646,7 +658,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if "add_whitelist_rule" in context.user_data:
             rid = context.user_data.pop("add_whitelist_rule")
             word = text.lower().strip()
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 wl = rule.whitelist_words or []
                 if word not in wl:
@@ -659,7 +671,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # Edit header
         if "edit_header_rule" in context.user_data:
             rid = context.user_data.pop("edit_header_rule")
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.header_text = text
                 session.commit()
@@ -669,7 +681,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # Edit footer
         if "edit_footer_rule" in context.user_data:
             rid = context.user_data.pop("edit_footer_rule")
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if rule:
                 rule.footer_text = text
                 session.commit()
@@ -679,7 +691,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # Set schedule
         if "set_schedule_rule" in context.user_data:
             rid = context.user_data.pop("set_schedule_rule")
-            rule = session.query(ForwardRule).get(int(rid))
+            rule = session.get(ForwardRule, int(rid))
             if not rule:
                 await update.message.reply_text("Rule not found.")
                 return
@@ -774,7 +786,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # blacklist
             skip = False
             if rule.blacklist_words:
-                for w in rule.blacklist_words:
+                for w in (rule.blacklist_words or []):
                     if w and w in text_lower:
                         skip = True
                         break
@@ -784,7 +796,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # whitelist (must contain at least one)
             if rule.whitelist_words:
                 ok = False
-                for w in rule.whitelist_words:
+                for w in (rule.whitelist_words or []):
                     if w and w in text_lower:
                         ok = True
                         break
@@ -795,9 +807,9 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_text = text_to_process
             text_modified = False
             if rule.text_replacements and final_text:
-                # ensure iteration over keys is stable: replace all occurrences for each key
+                # iterate over items (make list to avoid runtime mutation issues)
                 for find, repl in list((rule.text_replacements or {}).items()):
-                    if find in final_text:
+                    if find and find in final_text:
                         final_text = final_text.replace(find, repl)
                         text_modified = True
 
@@ -816,7 +828,7 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if force_copy:
                     # media -> copy_message with caption
-                    if getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None) or getattr(message, "audio", None):
+                    if getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None) or getattr(message, "audio", None) or getattr(message, "sticker", None):
                         caption_to_send = final_text if final_text else ""
                         await context.bot.copy_message(chat_id=rule.destination_chat_id, from_chat_id=message.chat.id, message_id=message.message_id, caption=caption_to_send)
                     else:
