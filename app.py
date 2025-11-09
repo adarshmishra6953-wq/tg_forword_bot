@@ -14,6 +14,7 @@ import logging
 import time
 import re
 import json
+import urllib.parse
 from datetime import datetime
 from typing import Optional, List
 from zoneinfo import ZoneInfo
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------ Config ------------------
 # Fixed admin ID (your ID)
-FORCE_ADMIN_ID = 1695450646  # you said this is fixed earlier (kept as requested)
+FORCE_ADMIN_ID = 1695450646  # fixed admin as requested
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -68,9 +69,9 @@ class ForwardRule(Base):
     is_active = Column(Boolean, default=True)
     block_links = Column(Boolean, default=False)
     block_usernames = Column(Boolean, default=False)
-    blacklist_words = Column(PickleType, default=list)
-    whitelist_words = Column(PickleType, default=list)
-    text_replacements = Column(PickleType, default=dict)  # {find: replace}
+    blacklist_words = Column(PickleType, default=list)     # list[str]
+    whitelist_words = Column(PickleType, default=list)     # list[str]
+    text_replacements = Column(PickleType, default=dict)   # dict{find: replace}
 
     header_text = Column(String, nullable=True)
     footer_text = Column(String, nullable=True)
@@ -133,13 +134,11 @@ def ensure_tables_and_columns():
     logger.info(f"Missing columns detected: {missing}")
     # Add missing columns safely
     with Engine.connect() as conn:
-        # Begin a transaction
         trans = conn.begin()
         try:
             for col in missing:
                 pg_type, sqlite_type = expected_columns[col]
                 sql_type = pg_type if dialect.startswith("postgres") or dialect == "postgresql" else sqlite_type
-                # Compose ALTER TABLE statement
                 alter_sql = f'ALTER TABLE forward_rules ADD COLUMN "{col}" {sql_type};'
                 logger.info(f"Adding column {col} with SQL: {alter_sql}")
                 conn.execute(text(alter_sql))
@@ -148,8 +147,6 @@ def ensure_tables_and_columns():
         except Exception as e:
             trans.rollback()
             logger.exception(f"Failed to add missing columns automatically: {e}")
-            # We don't raise; allow app to continue (but admin will get errors if used)
-            # Still, log error so we can troubleshoot.
             return
 
 # Run schema ensure on startup
@@ -157,13 +154,17 @@ try:
     ensure_tables_and_columns()
 except Exception as e:
     logger.exception(f"Auto DB-fix failed on startup: {e}")
-    # Continue — create_all already ran; if add-columns failed, code will attempt to run
-    # but admin will be notified in logs.
 
 # ------------------ Helpers ------------------
 def admin_check(user_id: Optional[int]) -> bool:
     """Only fixed admin allowed."""
     return user_id == FORCE_ADMIN_ID
+
+def safe_str_join(lst):
+    try:
+        return ", ".join(lst or [])
+    except Exception:
+        return "None"
 
 def format_rule_summary(rule: ForwardRule) -> str:
     start = rule.schedule_start or "Any"
@@ -173,7 +174,7 @@ def format_rule_summary(rule: ForwardRule) -> str:
         f"Source: `{rule.source_chat_id}` → Dest: `{rule.destination_chat_id}`\n"
         f"Active: `{rule.is_active}` | Mode: `{rule.forward_mode}` | Delay: `{rule.forward_delay}s`\n"
         f"LinksBlocked: `{rule.block_links}` | UsernamesBlocked: `{rule.block_usernames}`\n"
-        f"Blacklist: `{', '.join(rule.blacklist_words or []) or 'None'}` | Whitelist: `{', '.join(rule.whitelist_words or []) or 'None'}`\n"
+        f"Blacklist: `{safe_str_join(rule.blacklist_words) or 'None'}` | Whitelist: `{safe_str_join(rule.whitelist_words) or 'None'}`\n"
         f"Header: `{(rule.header_text[:40] + '...') if rule.header_text else 'None'}` | Footer: `{(rule.footer_text[:40] + '...') if rule.footer_text else 'None'}`\n"
         f"Replacements: `{len(rule.text_replacements or {})} rules` | Schedule: `{start}-{end}`\n"
         f"Forwarded Count: `{rule.forwarded_count}`"
@@ -206,7 +207,8 @@ def rule_settings_keyboard(rule: ForwardRule):
         [InlineKeyboardButton(f"Links: {'✅' if rule.block_links else '❌'}", callback_data=f"toggle_links|{rid}"), InlineKeyboardButton(f"Usernames: {'✅' if rule.block_usernames else '❌'}", callback_data=f"toggle_usernames|{rid}")],
         [InlineKeyboardButton(f"Mode: {rule.forward_mode}", callback_data=f"set_mode|{rid}"), InlineKeyboardButton(f"Delay: {rule.forward_delay}s", callback_data=f"set_delay|{rid}")],
         [InlineKeyboardButton("➕ Add Replace", callback_data=f"add_replace|{rid}"), InlineKeyboardButton("📄 View Replacements", callback_data=f"view_replace|{rid}")],
-        [InlineKeyboardButton("➕ Blacklist Word", callback_data=f"add_blacklist|{rid}"), InlineKeyboardButton("➕ Whitelist Word", callback_data=f"add_whitelist|{rid}")],
+        [InlineKeyboardButton("➕ Blacklist Word", callback_data=f"add_blacklist|{rid}"), InlineKeyboardButton("📋 View Blacklist", callback_data=f"view_blacklist|{rid}")],
+        [InlineKeyboardButton("➕ Whitelist Word", callback_data=f"add_whitelist|{rid}"), InlineKeyboardButton("📋 View Whitelist", callback_data=f"view_whitelist|{rid}")],
         [InlineKeyboardButton("🖊️ Edit Header", callback_data=f"edit_header|{rid}"), InlineKeyboardButton("🖊️ Edit Footer", callback_data=f"edit_footer|{rid}")],
         [InlineKeyboardButton("🕒 Set Schedule", callback_data=f"set_schedule|{rid}"), InlineKeyboardButton("⬅️ Back", callback_data="main")],
     ]
@@ -234,11 +236,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Keval admin is bot ko use kar sakta hai.")
         return
 
-    data = query.data
+    data = query.data or ""
     logger.info(f"Callback data: {data} from {user.id}")
 
     session = Session()
     try:
+        # simple navigation
         if data in ("main", "refresh"):
             await query.edit_message_text("Main Menu", reply_markup=main_menu_keyboard())
             return
@@ -258,6 +261,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Rules:", reply_markup=InlineKeyboardMarkup(buttons))
             return
 
+        # open rule main
         if data.startswith("rule_open|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -267,6 +271,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(format_rule_summary(rule), reply_markup=rule_action_keyboard(rule), parse_mode="Markdown")
             return
 
+        # enable/disable
         if data.startswith("toggle_active|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -276,6 +281,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"Rule #{rule.id} active={rule.is_active}", reply_markup=rule_action_keyboard(rule))
             return
 
+        # delete rule
         if data.startswith("delete_rule|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -285,12 +291,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"Rule #{rid} deleted.", reply_markup=main_menu_keyboard())
             return
 
+        # edit name start
         if data.startswith("edit_name|"):
             _, rid = data.split("|", 1)
             context.user_data["edit_name_rule"] = int(rid)
             await query.edit_message_text("Send new name for the rule:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data="main")]]))
             return
 
+        # settings open
         if data.startswith("settings|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -298,6 +306,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(format_rule_summary(rule), reply_markup=rule_settings_keyboard(rule), parse_mode="Markdown")
             return
 
+        # stats
         if data.startswith("stats|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -306,6 +315,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(txt, reply_markup=rule_action_keyboard(rule))
             return
 
+        # export
         if data.startswith("export_rule|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -332,6 +342,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(json.dumps(payload, ensure_ascii=False, indent=2))
             return
 
+        # toggle links/usernames
         if data.startswith("toggle_links|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -350,6 +361,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(format_rule_summary(rule), reply_markup=rule_settings_keyboard(rule), parse_mode="Markdown")
             return
 
+        # toggle mode
         if data.startswith("set_mode|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
@@ -359,41 +371,146 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(format_rule_summary(rule), reply_markup=rule_settings_keyboard(rule), parse_mode="Markdown")
             return
 
+        # set delay start
         if data.startswith("set_delay|"):
             _, rid = data.split("|", 1)
             context.user_data["set_delay_rule"] = int(rid)
             await query.edit_message_text("Send delay in seconds (0/5/15/30/60):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data="main")]]))
             return
 
+        # add replacement start
         if data.startswith("add_replace|"):
             _, rid = data.split("|", 1)
             context.user_data["add_replace_rule"] = int(rid)
+            # ask for FIND text; flow continues in text handler
             await query.edit_message_text("Send FIND text (case sensitive):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data="main")]]))
             return
 
+        # view replacements -> show list with delete buttons
         if data.startswith("view_replace|"):
             _, rid = data.split("|", 1)
             rule = session.query(ForwardRule).get(int(rid))
-            if rule:
-                if not rule.text_replacements:
-                    await query.edit_message_text("No replacements set.", reply_markup=rule_settings_keyboard(rule))
-                else:
-                    txt = "\n".join([f"'{k}' → '{v}'" for k, v in (rule.text_replacements or {}).items()])
-                    await query.edit_message_text(f"Replacements:\n{txt}", reply_markup=rule_settings_keyboard(rule))
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            replacements = rule.text_replacements or {}
+            if not replacements:
+                await query.edit_message_text("Koi replacement set nahi hai.", reply_markup=rule_settings_keyboard(rule))
+                return
+            # build buttons: each replacement shows delete button
+            buttons = []
+            for find, repl in replacements.items():
+                # encode find key
+                key_enc = urllib.parse.quote_plus(find)
+                buttons.append([InlineKeyboardButton(f"'{find}' → '{repl}'", callback_data=f"noop")])
+                buttons.append([InlineKeyboardButton("❌ Delete", callback_data=f"del_replace|{rid}|{key_enc}")])
+            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"settings|{rid}")])
+            await query.edit_message_text("Replacements (click Delete to remove):", reply_markup=InlineKeyboardMarkup(buttons))
             return
 
+        # delete replacement callback
+        if data.startswith("del_replace|"):
+            _, rid, key_enc = data.split("|", 2)
+            find = urllib.parse.unquote_plus(key_enc)
+            rule = session.query(ForwardRule).get(int(rid))
+            if rule:
+                replacements = rule.text_replacements or {}
+                if find in replacements:
+                    replacements.pop(find)
+                    rule.text_replacements = replacements
+                    session.commit()
+                    await query.edit_message_text(f"Replacement '{find}' deleted.", reply_markup=rule_settings_keyboard(rule))
+                else:
+                    await query.edit_message_text("Replacement not found.", reply_markup=rule_settings_keyboard(rule))
+            return
+
+        # add blacklist start
         if data.startswith("add_blacklist|"):
             _, rid = data.split("|", 1)
             context.user_data["add_blacklist_rule"] = int(rid)
             await query.edit_message_text("Send word to ADD to blacklist (single word):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data="main")]]))
             return
 
+        # view blacklist with delete buttons
+        if data.startswith("view_blacklist|"):
+            _, rid = data.split("|", 1)
+            rule = session.query(ForwardRule).get(int(rid))
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            bl = rule.blacklist_words or []
+            if not bl:
+                await query.edit_message_text("Blacklist empty.", reply_markup=rule_settings_keyboard(rule))
+                return
+            buttons = []
+            for w in bl:
+                w_enc = urllib.parse.quote_plus(w)
+                buttons.append([InlineKeyboardButton(f"{w}", callback_data="noop")])
+                buttons.append([InlineKeyboardButton("❌ Remove", callback_data=f"del_black|{rid}|{w_enc}")])
+            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"settings|{rid}")])
+            await query.edit_message_text("Blacklist (Remove to delete):", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        # delete blacklist item
+        if data.startswith("del_black|"):
+            _, rid, w_enc = data.split("|", 2)
+            word = urllib.parse.unquote_plus(w_enc)
+            rule = session.query(ForwardRule).get(int(rid))
+            if rule:
+                bl = rule.blacklist_words or []
+                if word in bl:
+                    bl.remove(word)
+                    rule.blacklist_words = bl
+                    session.commit()
+                    await query.edit_message_text(f"Blacklist item '{word}' removed.", reply_markup=rule_settings_keyboard(rule))
+                else:
+                    await query.edit_message_text("Item not found.", reply_markup=rule_settings_keyboard(rule))
+            return
+
+        # add whitelist start
         if data.startswith("add_whitelist|"):
             _, rid = data.split("|", 1)
             context.user_data["add_whitelist_rule"] = int(rid)
             await query.edit_message_text("Send word to ADD to whitelist (single word):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data="main")]]))
             return
 
+        # view whitelist
+        if data.startswith("view_whitelist|"):
+            _, rid = data.split("|", 1)
+            rule = session.query(ForwardRule).get(int(rid))
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            wl = rule.whitelist_words or []
+            if not wl:
+                await query.edit_message_text("Whitelist empty.", reply_markup=rule_settings_keyboard(rule))
+                return
+            buttons = []
+            for w in wl:
+                w_enc = urllib.parse.quote_plus(w)
+                buttons.append([InlineKeyboardButton(f"{w}", callback_data="noop")])
+                buttons.append([InlineKeyboardButton("❌ Remove", callback_data=f"del_white|{rid}|{w_enc}")])
+            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"settings|{rid}")])
+            await query.edit_message_text("Whitelist (Remove to delete):", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        # delete whitelist item
+        if data.startswith("del_white|"):
+            _, rid, w_enc = data.split("|", 2)
+            word = urllib.parse.unquote_plus(w_enc)
+            rule = session.query(ForwardRule).get(int(rid))
+            if rule:
+                wl = rule.whitelist_words or []
+                if word in wl:
+                    wl.remove(word)
+                    rule.whitelist_words = wl
+                    session.commit()
+                    await query.edit_message_text(f"Whitelist item '{word}' removed.", reply_markup=rule_settings_keyboard(rule))
+                else:
+                    await query.edit_message_text("Item not found.", reply_markup=rule_settings_keyboard(rule))
+            return
+
+        # edit header/footer
         if data.startswith("edit_header|"):
             _, rid = data.split("|", 1)
             context.user_data["edit_header_rule"] = int(rid)
@@ -406,6 +523,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Send footer text (this text will append to forwarded messages):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data="main")]]))
             return
 
+        # schedule
         if data.startswith("set_schedule|"):
             _, rid = data.split("|", 1)
             context.user_data["set_schedule_rule"] = int(rid)
@@ -414,6 +532,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "global_info":
             await query.edit_message_text(f"Admin: {FORCE_ADMIN_ID}\nDB: {DATABASE_URL}\nTZ: Asia/Kolkata", reply_markup=main_menu_keyboard())
+            return
+
+        # noop for display-only buttons
+        if data == "noop":
             return
 
     finally:
@@ -425,7 +547,10 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not admin_check(user.id):
         return
 
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
     session = Session()
     try:
         # Creating rule flow
@@ -483,7 +608,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text("Delay updated.", reply_markup=main_menu_keyboard())
             return
 
-        # Add replacement flow
+        # Add replacement flow (two-step)
         if "add_replace_rule" in context.user_data and "replace_find" not in context.user_data:
             rid = context.user_data["add_replace_rule"]
             context.user_data["replace_find"] = text
@@ -496,10 +621,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             rule = session.query(ForwardRule).get(int(rid))
             if rule:
                 replacements = rule.text_replacements or {}
+                # ensure we can add multiple replacements without overwriting
                 replacements[find] = repl
                 rule.text_replacements = replacements
                 session.commit()
-                await update.message.reply_text("Replacement saved.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("Replacement saved.", reply_markup=rule_settings_keyboard(rule))
             return
 
         # Add blacklist word
@@ -513,7 +639,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     bl.append(word)
                     rule.blacklist_words = bl
                     session.commit()
-                await update.message.reply_text("Blacklist updated.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("Blacklist updated.", reply_markup=rule_settings_keyboard(rule))
             return
 
         # Add whitelist word
@@ -527,7 +653,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     wl.append(word)
                     rule.whitelist_words = wl
                     session.commit()
-                await update.message.reply_text("Whitelist updated.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("Whitelist updated.", reply_markup=rule_settings_keyboard(rule))
             return
 
         # Edit header
@@ -537,7 +663,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if rule:
                 rule.header_text = text
                 session.commit()
-                await update.message.reply_text("Header updated.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("Header updated.", reply_markup=rule_settings_keyboard(rule))
             return
 
         # Edit footer
@@ -547,7 +673,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if rule:
                 rule.footer_text = text
                 session.commit()
-                await update.message.reply_text("Footer updated.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("Footer updated.", reply_markup=rule_settings_keyboard(rule))
             return
 
         # Set schedule
@@ -561,7 +687,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 rule.schedule_start = None
                 rule.schedule_end = None
                 session.commit()
-                await update.message.reply_text("Schedule cleared.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("Schedule cleared.", reply_markup=rule_settings_keyboard(rule))
                 return
             parts = text.split()
             if len(parts) != 2:
@@ -577,7 +703,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             rule.schedule_start = start
             rule.schedule_end = end
             session.commit()
-            await update.message.reply_text("Schedule saved.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("Schedule saved.", reply_markup=rule_settings_keyboard(rule))
             return
 
     finally:
@@ -669,7 +795,8 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_text = text_to_process
             text_modified = False
             if rule.text_replacements and final_text:
-                for find, repl in (rule.text_replacements or {}).items():
+                # ensure iteration over keys is stable: replace all occurrences for each key
+                for find, repl in list((rule.text_replacements or {}).items()):
                     if find in final_text:
                         final_text = final_text.replace(find, repl)
                         text_modified = True
