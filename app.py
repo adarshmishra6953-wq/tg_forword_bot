@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, PickleType, DateTime, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import OperationalError
 
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------ Config ------------------
 # Fixed admin ID (your ID)
-FORCE_ADMIN_ID = 1695450646
+FORCE_ADMIN_ID = 1695450646  # you said this is fixed earlier (kept as requested)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -91,13 +91,74 @@ class MetaConfig(Base):
     admin_user_id = Column(Integer, default=FORCE_ADMIN_ID)
 
 
-# Create tables
-try:
+# ------------------ Auto DB-fix helper ------------------
+def ensure_tables_and_columns():
+    """
+    Create tables if missing (create_all), then inspect existing columns and add any missing columns
+    to forward_rules table automatically using ALTER TABLE (supports sqlite & postgresql).
+    """
+    inspector = inspect(Engine)
+
+    # Ensure tables exist (will create missing tables)
     Base.metadata.create_all(Engine)
-    logger.info("Database initialized")
-except OperationalError as e:
-    logger.error(f"DB init error: {e}")
-    raise
+
+    # Now ensure forward_rules exists and its columns are present
+    if not inspector.has_table("forward_rules"):
+        logger.info("forward_rules table not present after create_all (unexpected).")
+        return
+
+    existing_cols = {col["name"] for col in inspector.get_columns("forward_rules")}
+    logger.info(f"Existing forward_rules columns: {existing_cols}")
+
+    # desired columns with SQL types per dialect
+    dialect = Engine.dialect.name  # 'postgresql' or 'sqlite' etc.
+    logger.info(f"DB dialect detected: {dialect}")
+
+    # Map column name -> (postgres_type, sqlite_type)
+    expected_columns = {
+        "header_text": ("TEXT", "TEXT"),
+        "footer_text": ("TEXT", "TEXT"),
+        "text_replacements": ("BYTEA", "BLOB"),   # PickleType -> BYTEA (pg) / BLOB (sqlite)
+        "blacklist_words": ("BYTEA", "BLOB"),
+        "whitelist_words": ("BYTEA", "BLOB"),
+        "forwarded_count": ("INTEGER", "INTEGER"),
+        "last_triggered": ("TIMESTAMP", "DATETIME"),
+    }
+
+    missing = [c for c in expected_columns.keys() if c not in existing_cols]
+    if not missing:
+        logger.info("No missing columns in forward_rules.")
+        return
+
+    logger.info(f"Missing columns detected: {missing}")
+    # Add missing columns safely
+    with Engine.connect() as conn:
+        # Begin a transaction
+        trans = conn.begin()
+        try:
+            for col in missing:
+                pg_type, sqlite_type = expected_columns[col]
+                sql_type = pg_type if dialect.startswith("postgres") or dialect == "postgresql" else sqlite_type
+                # Compose ALTER TABLE statement
+                alter_sql = f'ALTER TABLE forward_rules ADD COLUMN "{col}" {sql_type};'
+                logger.info(f"Adding column {col} with SQL: {alter_sql}")
+                conn.execute(text(alter_sql))
+            trans.commit()
+            logger.info("Missing columns added successfully.")
+        except Exception as e:
+            trans.rollback()
+            logger.exception(f"Failed to add missing columns automatically: {e}")
+            # We don't raise; allow app to continue (but admin will get errors if used)
+            # Still, log error so we can troubleshoot.
+            return
+
+# Run schema ensure on startup
+try:
+    ensure_tables_and_columns()
+except Exception as e:
+    logger.exception(f"Auto DB-fix failed on startup: {e}")
+    # Continue — create_all already ran; if add-columns failed, code will attempt to run
+    # but admin will be notified in logs.
 
 # ------------------ Helpers ------------------
 def admin_check(user_id: Optional[int]) -> bool:
