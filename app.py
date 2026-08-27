@@ -33,7 +33,13 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+try:
+    # Newer python-telegram-bot versions
+    from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+except ImportError:
+    # Compatibility with versions where FSInputFile is not exported
+    from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+    FSInputFile = InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
