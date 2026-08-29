@@ -575,25 +575,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Koi replacement set nahi hai.", reply_markup=rule_settings_keyboard(rule))
                 return
             buttons = []
-            for find, repl in replacements.items():
-                key_enc = urllib.parse.quote_plus(find)
-                buttons.append([InlineKeyboardButton(f"'{find}' → '{repl}'", callback_data="noop")])
-                buttons.append([InlineKeyboardButton("❌ Delete", callback_data=f"del_replace|{rid}|{key_enc}")])
+            replacement_items = list(replacements.items())
+            for idx, (find, repl) in enumerate(replacement_items):
+                # IMPORTANT: Telegram callback_data has a very small size limit.
+                # Never put the actual FIND text/URL inside callback_data.
+                # Use only a short numeric index instead.
+                find_preview = str(find).replace("\n", " ")
+                repl_preview = str(repl).replace("\n", " ")
+                if len(find_preview) > 45:
+                    find_preview = find_preview[:42] + "..."
+                if len(repl_preview) > 45:
+                    repl_preview = repl_preview[:42] + "..."
+                buttons.append([InlineKeyboardButton(
+                    f"{find_preview} → {repl_preview}",
+                    callback_data="noop"
+                )])
+                # Only rid + numeric index goes into callback_data.
+                buttons.append([InlineKeyboardButton(
+                    "❌ Delete",
+                    callback_data=f"del_replace|{rid}|{idx}"
+                )])
             buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"settings|{rid}")])
             await query.edit_message_text("Replacements:", reply_markup=InlineKeyboardMarkup(buttons))
             return
 
         if data.startswith("del_replace|"):
-            _, rid, key_enc = data.split("|", 2)
-            find = urllib.parse.unquote_plus(key_enc)
+            _, rid, idx_str = data.split("|", 2)
             rule = session.get(ForwardRule, int(rid))
             if rule:
                 replacements = rule.text_replacements or {}
-                if find in replacements:
-                    replacements.pop(find)
-                    rule.text_replacements = replacements
-                    session.commit()
-                await query.edit_message_text(format_rule_summary(rule), reply_markup=rule_settings_keyboard(rule), parse_mode="Markdown")
+                try:
+                    idx = int(idx_str)
+                    keys = list(replacements.keys())
+                    if 0 <= idx < len(keys):
+                        replacements.pop(keys[idx], None)
+                        rule.text_replacements = replacements
+                        session.commit()
+                    else:
+                        await query.answer("Replacement not found", show_alert=True)
+                        return
+                except (ValueError, TypeError):
+                    await query.answer("Invalid replacement ID", show_alert=True)
+                    return
+                await query.edit_message_text(
+                    format_rule_summary(rule),
+                    reply_markup=rule_settings_keyboard(rule),
+                    parse_mode="Markdown"
+                )
             return
 
         if data.startswith("add_blacklist|"):
