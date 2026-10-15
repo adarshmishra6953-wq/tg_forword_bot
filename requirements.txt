@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]
 flask
 SQLAlchemy
 psycopg2-binary
+psycopg[binary]
