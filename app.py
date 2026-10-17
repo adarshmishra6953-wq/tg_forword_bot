@@ -101,6 +101,27 @@ BUTTON_COLORS = {
 }
 
 
+def make_url_button(button: Dict[str, Any]) -> InlineKeyboardButton:
+    """Create a URL button, using style only when the installed PTB supports it."""
+    label = str(button.get("text") or "Link")[:64]
+    url = str(button.get("url") or "").strip()
+    if not url:
+        raise ValueError("URL button has no URL")
+    color = button.get("color", "default")
+    # Validate URL scheme before sending it to Telegram.
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Invalid button URL: {url}")
+    style = color if color in ("primary", "success", "danger") else None
+    if style:
+        try:
+            return InlineKeyboardButton(text=label, url=url, style=style)
+        except TypeError:
+            # Older python-telegram-bot versions don't support the style field.
+            pass
+    return InlineKeyboardButton(text=label, url=url)
+
+
 # ------------------ Config ------------------
 
 FORCE_ADMIN_ID = 1695450646
@@ -455,6 +476,82 @@ def save_button_configs(rule: ForwardRule, configs: List[Dict[str, Any]]) -> Non
     rule.button_text = first["text"] if first else None
     rule.button_url = first["url"] if first else None
     rule.button_trigger_words = list(first["keywords"]) if first else []
+
+
+
+
+def next_button_id(configs: List[Dict[str, Any]]) -> int:
+    """Return a stable positive ID that is not currently used by any button."""
+    used = set()
+    for item in configs or []:
+        try:
+            used.add(int(item.get("id")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    candidate = 1
+    while candidate in used:
+        candidate += 1
+    return candidate
+
+
+def button_management_keyboard(rule: ForwardRule) -> InlineKeyboardMarkup:
+    """Main keyboard for adding, viewing and bulk-managing URL buttons."""
+    configs = get_button_configs(rule)
+    enabled_count = sum(1 for item in configs if item.get("enabled", True))
+    rid = rule.id
+    rows = [
+        [InlineKeyboardButton("➕ Add Button", callback_data=f"btn_add|{rid}")],
+        [InlineKeyboardButton(
+            f"📋 View / Edit Buttons ({len(configs)})",
+            callback_data=f"btn_list|{rid}",
+        )],
+    ]
+    if configs:
+        if enabled_count:
+            rows.append([InlineKeyboardButton(
+                "⛔ Disable All Buttons",
+                callback_data=f"btn_disable_all|{rid}",
+            )])
+        if enabled_count < len(configs):
+            rows.append([InlineKeyboardButton(
+                "✅ Enable All Buttons",
+                callback_data=f"btn_enable_all|{rid}",
+            )])
+    rows.append([InlineKeyboardButton(
+        "⬅️ Back to Settings",
+        callback_data=f"settings|{rid}",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def button_list_keyboard(rule: ForwardRule) -> InlineKeyboardMarkup:
+    """Keyboard listing each button with a stable callback identifier."""
+    rid = rule.id
+    configs = get_button_configs(rule)
+    rows = []
+    for button in sorted(configs, key=lambda b: (int(b.get("position", 1)), int(b.get("id", 1)))):
+        status = "🟢" if button.get("enabled", True) else "🔴"
+        label = f"{status} {button.get('position', 1)}. {button.get('text', 'Link')}"
+        rows.append([InlineKeyboardButton(
+            label[:64],
+            callback_data=f"btn_item|{rid}|{int(button['id'])}",
+        )])
+    rows.append([InlineKeyboardButton(
+        "⬅️ Back",
+        callback_data=f"button_manage|{rid}",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def single_button_keyboard(rule_id: int, button_id: int) -> InlineKeyboardMarkup:
+    """Actions available for one configured button."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Enable / Disable", callback_data=f"btn_toggle|{rule_id}|{button_id}")],
+        [InlineKeyboardButton("↕️ Change Position", callback_data=f"btn_position|{rule_id}|{button_id}")],
+        [InlineKeyboardButton("🎨 Change Color", callback_data=f"btn_color|{rule_id}|{button_id}")],
+        [InlineKeyboardButton("🗑 Delete This Button", callback_data=f"btn_delete|{rule_id}|{button_id}")],
+        [InlineKeyboardButton("⬅️ Back to Button List", callback_data=f"btn_list|{rule_id}")],
+    ])
 
 
 def format_rule_summary(rule: ForwardRule) -> str:
@@ -2694,28 +2791,6 @@ def matching_buttons(rule: ForwardRule, messages) -> List[Dict[str, Any]]:
         if keywords and any(word and word.lower() in combined_text for word in keywords):
             matched.append(button)
     return sorted(matched, key=lambda b: (int(b.get("position", 1)), int(b.get("id", 1))))
-
-
-def make_url_button(button: Dict[str, Any]) -> InlineKeyboardButton:
-    """Build a URL button and apply its selected Telegram style when supported."""
-    text = str(button.get("text") or "Link")[:64]
-    url = str(button.get("url") or "").strip()
-    color = button.get("color", "default")
-
-    # A URL is required by Telegram. Invalid/empty configurations should not
-    # crash the entire forwarding task; use a safe placeholder URL only when
-    # a malformed stored configuration is encountered.
-    if not url.startswith(("https://", "http://", "tg://")):
-        url = "https://t.me/"
-
-    style = color if color in ("primary", "success", "danger") else None
-    if style:
-        try:
-            return InlineKeyboardButton(text=text, url=url, style=style)
-        except (TypeError, ValueError):
-            # Older python-telegram-bot versions do not expose the style field.
-            pass
-    return InlineKeyboardButton(text=text, url=url)
 
 
 def build_button_markup(buttons: List[Dict[str, Any]]):
