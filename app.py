@@ -37,6 +37,10 @@ try:
         Update,
         InlineKeyboardMarkup,
         InlineKeyboardButton,
+        InputMediaPhoto,
+        InputMediaVideo,
+        InputMediaDocument,
+        InputMediaAudio,
         FSInputFile,
     )
 except ImportError:
@@ -44,6 +48,10 @@ except ImportError:
         Update,
         InlineKeyboardMarkup,
         InlineKeyboardButton,
+        InputMediaPhoto,
+        InputMediaVideo,
+        InputMediaDocument,
+        InputMediaAudio,
         InputFile,
     )
     FSInputFile = InputFile
@@ -162,6 +170,13 @@ class ForwardRule(Base):
         default=list,
     )
 
+    # Multiple keyword buttons; each item stores text, URL, keywords,
+    # color/style, position, enabled flag and a stable ID.
+    button_configs = Column(
+        MutableList.as_mutable(PickleType),
+        default=list,
+    )
+
     text_replacements = Column(
         MutableDict.as_mutable(PickleType),
         default=dict,
@@ -226,6 +241,7 @@ def ensure_tables_and_columns():
             "button_text": ("TEXT", "TEXT"),
             "button_url": ("TEXT", "TEXT"),
             "button_trigger_words": ("BYTEA", "BLOB"),
+            "button_configs": ("BYTEA", "BLOB"),
             "forwarded_count": ("INTEGER", "INTEGER"),
             "last_triggered": ("TIMESTAMP", "DATETIME"),
         }
@@ -387,9 +403,8 @@ def format_rule_summary(rule: ForwardRule) -> str:
         f"Whitelist: `{safe_str_join(rule.whitelist_words) or 'None'}`\n"
         f"Header: `{(rule.header_text[:40] + '...') if rule.header_text else 'None'}` | "
         f"Footer: `{(rule.footer_text[:40] + '...') if rule.footer_text else 'None'}`\n"
-        f"Button: `{rule.button_text or 'None'}` | "
-        f"Button keywords: "
-        f"`{safe_str_join(rule.button_trigger_words) or 'None'}`\n"
+        f"Buttons: `{len(get_button_configs(rule))} configured` | "
+        f"Enabled: `{sum(1 for b in get_button_configs(rule) if b.get('enabled', True))}`\\n"
         f"Replacements: `{len(rule.text_replacements or {})} rules` | "
         f"Schedule: `{start}-{end}`\n"
         f"Forwarded Count: `{rule.forwarded_count or 0}`"
@@ -559,12 +574,8 @@ def rule_settings_keyboard(rule: ForwardRule):
         ],
         [
             InlineKeyboardButton(
-                "🔘 Setup Keyword Button",
-                callback_data=f"setup_button|{rid}",
-            ),
-            InlineKeyboardButton(
-                "🗑 Disable Button",
-                callback_data=f"disable_button|{rid}",
+                "🔘 Manage Multiple Buttons",
+                callback_data=f"button_manage|{rid}",
             ),
         ],
         [
@@ -628,6 +639,7 @@ def rule_to_dict(rule: ForwardRule) -> Dict[str, Any]:
         "button_text": rule.button_text,
         "button_url": rule.button_url,
         "button_trigger_words": list(rule.button_trigger_words or []),
+        "button_configs": list(get_button_configs(rule)),
         "forwarded_count": int(rule.forwarded_count or 0),
         "last_triggered": (
             rule.last_triggered.isoformat()
@@ -717,6 +729,7 @@ def restore_backup_data(session, data: Dict[str, Any]):
             button_trigger_words=list(
                 item.get("button_trigger_words") or []
             ),
+            button_configs=list(item.get("button_configs") or []),
             forwarded_count=max(
                 0, int(item.get("forwarded_count", 0) or 0)
             ),
@@ -1550,9 +1563,188 @@ async def callback_handler(
             )
             return
 
-        # ---------------- Keyword Button Setup ----------------
+        # ---------------- Multiple Keyword Buttons ----------------
 
+        if data.startswith("button_manage|"):
+            rid = int(data.split("|", 1)[1])
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            configs = get_button_configs(rule)
+            if not rule.button_configs and configs:
+                save_button_configs(rule, configs)
+                session.commit()
+            await query.edit_message_text(
+                f"Button Manager — Rule #{rid}\\nTotal: {len(configs)} | Enabled: {sum(1 for b in configs if b.get('enabled', True))}",
+                reply_markup=button_management_keyboard(rule),
+            )
+            return
+
+        if data.startswith("btn_add|"):
+            rid = int(data.split("|", 1)[1])
+            if not session.get(ForwardRule, rid):
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            context.user_data["multi_button_setup"] = {"rule_id": rid, "step": "text"}
+            await query.edit_message_text(
+                "Naye button ka text bhejein (maximum 64 characters).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"button_manage|{rid}")]]),
+            )
+            return
+
+        if data.startswith("btn_list|"):
+            rid = int(data.split("|", 1)[1])
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            configs = get_button_configs(rule)
+            if not configs:
+                await query.edit_message_text(
+                    "Abhi koi button configured nahi hai.",
+                    reply_markup=button_management_keyboard(rule),
+                )
+                return
+            await query.edit_message_text(
+                "Kisi button ko manage karne ke liye select karein:",
+                reply_markup=button_list_keyboard(rule),
+            )
+            return
+
+        if data.startswith("btn_item|"):
+            _, rid_text, bid_text = data.split("|", 2)
+            rid, bid = int(rid_text), int(bid_text)
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            button = next((b for b in get_button_configs(rule) if b["id"] == bid), None)
+            if not button:
+                await query.edit_message_text("Button nahi mila.")
+                return
+            await query.edit_message_text(
+                f"Button #{bid}: {button['text']}\\n"
+                f"Position: {button['position']}\\n"
+                f"Color: {BUTTON_COLORS.get(button['color'], 'Default')}\\n"
+                f"Keywords: {', '.join(button['keywords']) or 'None'}\\n"
+                f"Status: {'Enabled' if button.get('enabled', True) else 'Disabled'}",
+                reply_markup=single_button_keyboard(rid, bid),
+            )
+            return
+
+        if data.startswith("btn_disable_all|") or data.startswith("btn_enable_all|"):
+            action, rid_text = data.split("|", 1)
+            rid = int(rid_text)
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            configs = get_button_configs(rule)
+            state = action == "btn_enable_all"
+            for button in configs:
+                button["enabled"] = state
+            save_button_configs(rule, configs)
+            session.commit()
+            await query.edit_message_text(
+                "Sabhi buttons " + ("enable" if state else "disable") + " kar diye gaye.",
+                reply_markup=button_management_keyboard(rule),
+            )
+            return
+
+        if data.startswith("btn_toggle|"):
+            _, rid_text, bid_text = data.split("|", 2)
+            rid, bid = int(rid_text), int(bid_text)
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            configs = get_button_configs(rule)
+            button = next((b for b in configs if b["id"] == bid), None)
+            if button:
+                button["enabled"] = not button.get("enabled", True)
+                save_button_configs(rule, configs)
+                session.commit()
+            await query.edit_message_text(
+                "Button status updated.",
+                reply_markup=single_button_keyboard(rid, bid),
+            )
+            return
+
+        if data.startswith("btn_delete|"):
+            _, rid_text, bid_text = data.split("|", 2)
+            rid, bid = int(rid_text), int(bid_text)
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            configs = [b for b in get_button_configs(rule) if b["id"] != bid]
+            save_button_configs(rule, configs)
+            session.commit()
+            await query.edit_message_text(
+                f"Button #{bid} delete kar diya gaya.",
+                reply_markup=button_management_keyboard(rule),
+            )
+            return
+
+        if data.startswith("btn_position|"):
+            _, rid_text, bid_text = data.split("|", 2)
+            rid, bid = int(rid_text), int(bid_text)
+            context.user_data["button_position_edit"] = {"rule_id": rid, "button_id": bid}
+            await query.edit_message_text(
+                "Is button ki nayi position number bhejein (1 se shuru).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"btn_item|{rid}|{bid}")]]),
+            )
+            return
+
+        if data.startswith("btn_color|"):
+            _, rid_text, bid_text = data.split("|", 2)
+            rid, bid = int(rid_text), int(bid_text)
+            context.user_data["button_color_edit"] = {"rule_id": rid, "button_id": bid}
+            await query.edit_message_text(
+                "Button color select karein:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Default", callback_data=f"btn_setcolor|{rid}|{bid}|default")],
+                    [InlineKeyboardButton("🔵 Blue", callback_data=f"btn_setcolor|{rid}|{bid}|primary")],
+                    [InlineKeyboardButton("🟢 Green", callback_data=f"btn_setcolor|{rid}|{bid}|success")],
+                    [InlineKeyboardButton("🔴 Red", callback_data=f"btn_setcolor|{rid}|{bid}|danger")],
+                    [InlineKeyboardButton("⬅️ Back", callback_data=f"btn_item|{rid}|{bid}")],
+                ]),
+            )
+            return
+
+        if data.startswith("btn_setcolor|"):
+            _, rid_text, bid_text, color = data.split("|", 3)
+            rid, bid = int(rid_text), int(bid_text)
+            rule = session.get(ForwardRule, rid)
+            if not rule or color not in BUTTON_COLORS:
+                await query.edit_message_text("Invalid rule/color.")
+                return
+            configs = get_button_configs(rule)
+            button = next((b for b in configs if b["id"] == bid), None)
+            if button:
+                button["color"] = color
+                save_button_configs(rule, configs)
+                session.commit()
+            await query.edit_message_text(
+                f"Button color set: {BUTTON_COLORS[color]}",
+                reply_markup=single_button_keyboard(rid, bid),
+            )
+            return
+
+        # Legacy callback now opens the multi-button manager.
         if data.startswith("setup_button|"):
+            rid = int(data.split("|", 1)[1])
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            await query.edit_message_text(
+                "Multiple Button Manager",
+                reply_markup=button_management_keyboard(rule),
+            )
+            return
+
 
             rid = int(data.split("|", 1)[1])
 
@@ -1581,26 +1773,55 @@ async def callback_handler(
             )
             return
 
-        # Disable keyword button
+        # Legacy disable button callback: disable every configured button.
         if data.startswith("disable_button|"):
-
             rid = int(data.split("|", 1)[1])
-
             rule = session.get(ForwardRule, rid)
-
             if not rule:
                 await query.edit_message_text("Rule nahi mila.")
                 return
-
-            rule.button_text = None
-            rule.button_url = None
-            rule.button_trigger_words = []
-
+            configs = get_button_configs(rule)
+            for button in configs:
+                button["enabled"] = False
+            save_button_configs(rule, configs)
             session.commit()
-
             await query.edit_message_text(
-                "Keyword button disable kar diya gaya hai.",
-                reply_markup=rule_settings_keyboard(rule),
+                "Sabhi buttons disable kar diye gaye.",
+                reply_markup=button_management_keyboard(rule),
+            )
+            return
+
+        if data.startswith("btn_newcolor|"):
+            _, rid_text, color = data.split("|", 2)
+            rid = int(rid_text)
+            state = context.user_data.get("multi_button_setup")
+            rule = session.get(ForwardRule, rid)
+            if not rule or not state or int(state.get("rule_id", -1)) != rid or color not in BUTTON_COLORS:
+                await query.edit_message_text("Button setup expire ho gaya. Dobara Add Button karein.")
+                return
+            configs = get_button_configs(rule)
+            new_button = {
+                "id": next_button_id(configs),
+                "text": state["text"],
+                "url": state["url"],
+                "keywords": state["keywords"],
+                "color": color,
+                "position": int(state["position"]),
+                "enabled": True,
+            }
+            # Insert at the requested one-based position.
+            insert_at = max(0, min(len(configs), int(state["position"]) - 1))
+            configs.sort(key=lambda b: (int(b.get("position", 1)), int(b.get("id", 1))))
+            configs.insert(insert_at, new_button)
+            for pos, item in enumerate(configs, start=1):
+                item["position"] = pos
+            save_button_configs(rule, configs)
+            session.commit()
+            context.user_data.pop("multi_button_setup", None)
+            await query.edit_message_text(
+                f"Button add ho gaya: {new_button['text']}\\n"
+                f"Position: {new_button['position']} | Color: {BUTTON_COLORS[color]}",
+                reply_markup=button_management_keyboard(rule),
             )
             return
 
@@ -1734,8 +1955,115 @@ async def text_message_handler(
                 )
                 return
 
-        # ---------------- Keyword Button Setup ----------------
+        # Set existing button position
+        if "button_position_edit" in context.user_data:
+            state = context.user_data.pop("button_position_edit")
+            rid = int(state["rule_id"])
+            bid = int(state["button_id"])
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await update.message.reply_text("Rule nahi mila.")
+                return
+            configs = get_button_configs(rule)
+            button = next((b for b in configs if b["id"] == bid), None)
+            if not button:
+                await update.message.reply_text("Button nahi mila.")
+                return
+            try:
+                position = int(text_value)
+                if position < 1 or position > len(configs):
+                    raise ValueError
+            except ValueError:
+                context.user_data["button_position_edit"] = state
+                await update.message.reply_text(f"Position 1 se {len(configs)} ke beech honi chahiye.")
+                return
+            configs = [b for b in configs if b["id"] != bid]
+            configs.insert(position - 1, button)
+            for pos, item in enumerate(configs, start=1):
+                item["position"] = pos
+            save_button_configs(rule, configs)
+            session.commit()
+            await update.message.reply_text(
+                f"Position update ho gayi: {position}",
+                reply_markup=single_button_keyboard(rid, bid),
+            )
+            return
 
+        # ---------------- Multi Button Setup Flow ----------------
+        if "multi_button_setup" in context.user_data:
+            state = context.user_data["multi_button_setup"]
+            rid = int(state["rule_id"])
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                context.user_data.pop("multi_button_setup", None)
+                await update.message.reply_text("Rule nahi mila.")
+                return
+
+            step = state.get("step")
+            if step == "text":
+                if not text_value or len(text_value) > 64:
+                    await update.message.reply_text("Button text 1-64 characters ka hona chahiye.")
+                    return
+                state["text"] = text_value
+                state["step"] = "url"
+                await update.message.reply_text("Ab button ka URL bhejein (https://...).")
+                return
+
+            if step == "url":
+                from urllib.parse import urlparse
+                parsed = urlparse(text_value)
+                if parsed.scheme not in ("http", "https") or not parsed.netloc or any(ch.isspace() for ch in text_value):
+                    await update.message.reply_text("Invalid URL. https://example.com jaisa link bhejein.")
+                    return
+                state["url"] = text_value
+                state["step"] = "keywords"
+                await update.message.reply_text("Ab is button ke trigger keywords comma se alag karke bhejein. Example: bonus, cricket, offer")
+                return
+
+            if step == "keywords":
+                words = list(dict.fromkeys(
+                    w.strip().lower() for w in text_value.split(",") if w.strip()
+                ))
+                if not words:
+                    await update.message.reply_text("Kam se kam ek keyword bhejein.")
+                    return
+                if any(len(w) > 200 for w in words):
+                    await update.message.reply_text("Har keyword maximum 200 characters ka ho.")
+                    return
+                state["keywords"] = words
+                state["step"] = "position"
+                configs = get_button_configs(rule)
+                await update.message.reply_text(
+                    f"Button ki position number bhejein (1-{len(configs)+1}). "
+                    "1 ka matlab pehle button ki position hai."
+                )
+                return
+
+            if step == "position":
+                try:
+                    position = int(text_value)
+                    configs = get_button_configs(rule)
+                    if position < 1 or position > len(configs) + 1:
+                        raise ValueError
+                except ValueError:
+                    await update.message.reply_text(
+                        f"Valid position bhejein: 1 se {len(get_button_configs(rule))+1}."
+                    )
+                    return
+                state["position"] = position
+                state["step"] = "color"
+                await update.message.reply_text(
+                    "Color choose karein: default, blue, green ya red.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Default", callback_data=f"btn_newcolor|{rid}|default")],
+                        [InlineKeyboardButton("🔵 Blue", callback_data=f"btn_newcolor|{rid}|primary")],
+                        [InlineKeyboardButton("🟢 Green", callback_data=f"btn_newcolor|{rid}|success")],
+                        [InlineKeyboardButton("🔴 Red", callback_data=f"btn_newcolor|{rid}|danger")],
+                    ]),
+                )
+                return
+
+        # ---------------- Legacy Button Setup Flow ----------------
         if "setup_button_rule" in context.user_data:
 
             rid = context.user_data["setup_button_rule"]
@@ -2281,33 +2609,34 @@ def is_media_message(message) -> bool:
     ])
 
 
-def get_keyword_button(rule: ForwardRule, message):
-
-    words = rule.button_trigger_words or []
-
-    if not rule.button_text or not rule.button_url or not words:
-        return None
-
-    original = (
-        message.text
-        or message.caption
-        or ""
+def matching_buttons(rule: ForwardRule, messages) -> List[Dict[str, Any]]:
+    configs = [b for b in get_button_configs(rule) if b.get("enabled", True)]
+    combined_text = " ".join(
+        (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        for message in messages
     ).lower()
+    matched = []
+    for button in configs:
+        keywords = button.get("keywords") or []
+        if keywords and any(word and word.lower() in combined_text for word in keywords):
+            matched.append(button)
+    return sorted(matched, key=lambda b: (int(b.get("position", 1)), int(b.get("id", 1))))
 
-    if any(
-        word and word.lower() in original
-        for word in words
-    ):
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    rule.button_text,
-                    url=rule.button_url,
-                )
-            ]
-        ])
 
-    return None
+def build_button_markup(buttons: List[Dict[str, Any]]):
+    if not buttons:
+        return None
+    rows = []
+    # Position is global order; use two buttons per row.
+    ordered = sorted(buttons, key=lambda b: (int(b.get("position", 1)), int(b.get("id", 1))))
+    for index in range(0, len(ordered), 2):
+        rows.append([make_url_button(button) for button in ordered[index:index + 2]])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_keyword_button(rule: ForwardRule, message):
+    buttons = matching_buttons(rule, [message])
+    return build_button_markup(buttons)
 
 
 async def send_one(
@@ -2317,17 +2646,10 @@ async def send_one(
     text_modified: bool,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     keyboard = get_keyword_button(rule, message)
-
-    force_copy = (
-        text_modified
-        or rule.forward_mode == "COPY"
-        or keyboard is not None
-    )
+    force_copy = text_modified or rule.forward_mode == "COPY" or keyboard is not None
 
     if rule.forward_mode == "FORWARD" and not force_copy:
-
         await context.bot.forward_message(
             chat_id=rule.destination_chat_id,
             from_chat_id=message.chat.id,
@@ -2336,7 +2658,6 @@ async def send_one(
         return
 
     if is_media_message(message):
-
         await context.bot.copy_message(
             chat_id=rule.destination_chat_id,
             from_chat_id=message.chat.id,
@@ -2344,9 +2665,7 @@ async def send_one(
             caption=final_text or "",
             reply_markup=keyboard,
         )
-
     elif final_text and final_text.strip():
-
         await context.bot.send_message(
             chat_id=rule.destination_chat_id,
             text=final_text,
@@ -2355,9 +2674,33 @@ async def send_one(
 
 
 async def asyncio_sleep(seconds: int):
-
     import asyncio
     await asyncio.sleep(seconds)
+
+
+def media_to_input_media(message, caption=None):
+    """Create InputMedia for preserving an album as a single Telegram media group."""
+    if getattr(message, "photo", None):
+        return InputMediaPhoto(
+            media=message.photo[-1].file_id,
+            caption=caption,
+        )
+    if getattr(message, "video", None):
+        return InputMediaVideo(
+            media=message.video.file_id,
+            caption=caption,
+        )
+    if getattr(message, "document", None):
+        return InputMediaDocument(
+            media=message.document.file_id,
+            caption=caption,
+        )
+    if getattr(message, "audio", None):
+        return InputMediaAudio(
+            media=message.audio.file_id,
+            caption=caption,
+        )
+    return None
 
 
 async def send_album(
@@ -2365,43 +2708,84 @@ async def send_album(
     messages: List,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    messages = sorted(messages, key=lambda message: message.message_id)
+    if len(messages) < 2:
+        if not messages:
+            return 0
+        final_text, modified = prepare_text(rule, messages[0])
+        if final_text is None:
+            return 0
+        await send_one(rule, messages[0], final_text, modified, context)
+        return 1
 
-    messages = sorted(
-        messages,
-        key=lambda message: message.message_id,
+    # Evaluate filtering against the whole album, so its items stay together.
+    combined = " ".join(
+        (message.text or message.caption or "")
+        for message in messages
+    )
+    proxy = type("AlbumTextProxy", (), {})()
+    proxy.text = combined
+    proxy.caption = None
+    final_combined, modified = prepare_text(rule, proxy)
+    if final_combined is None:
+        return 0
+
+    caption_index = next(
+        (i for i, message in enumerate(messages) if message.caption),
+        None,
+    )
+    caption_text = None
+    if caption_index is not None:
+        source_caption = messages[caption_index].caption or ""
+        caption_text = source_caption
+        for find_text, replace_text in (rule.text_replacements or {}).items():
+            if find_text:
+                caption_text = caption_text.replace(find_text, replace_text)
+        if rule.header_text:
+            caption_text = f"{rule.header_text}\\n\\n{caption_text}"
+        if rule.footer_text:
+            caption_text = f"{caption_text}\\n\\n{rule.footer_text}"
+
+    media = []
+    for index, message in enumerate(messages):
+        item_caption = caption_text if index == caption_index else None
+        item = media_to_input_media(message, caption=item_caption)
+        if item is None:
+            # Fallback to copy as a group if unsupported media type is present.
+            copied = await context.bot.copy_messages(
+                chat_id=rule.destination_chat_id,
+                from_chat_id=messages[0].chat.id,
+                message_ids=[m.message_id for m in messages],
+            )
+            buttons = matching_buttons(rule, messages)
+            keyboard = build_button_markup(buttons)
+            if keyboard:
+                await context.bot.send_message(
+                    chat_id=rule.destination_chat_id,
+                    text="Links:",
+                    reply_markup=keyboard,
+                )
+            return len(copied or messages)
+
+        media.append(item)
+
+    # Telegram does not support reply_markup on sendMediaGroup. Send the album
+    # together first, then add a separate button row if any keyword matches.
+    await context.bot.send_media_group(
+        chat_id=rule.destination_chat_id,
+        media=media,
     )
 
-    sent = 0
+    buttons = matching_buttons(rule, messages)
+    keyboard = build_button_markup(buttons)
+    if keyboard:
+        await context.bot.send_message(
+            chat_id=rule.destination_chat_id,
+            text="👇 Related links",
+            reply_markup=keyboard,
+        )
 
-    # Send individually so each message can have its own keyword button.
-    for message in messages:
-
-        final_text, modified = prepare_text(rule, message)
-
-        if final_text is None:
-            continue
-
-        try:
-            if rule.forward_delay > 0:
-                await asyncio_sleep(rule.forward_delay)
-
-            await send_one(
-                rule,
-                message,
-                final_text,
-                modified,
-                context,
-            )
-
-            sent += 1
-
-        except Exception:
-            logger.exception(
-                "Album item failed for rule %s",
-                rule.id,
-            )
-
-    return sent
+    return len(messages)
 
 
 async def process_single_message(
