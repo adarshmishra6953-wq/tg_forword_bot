@@ -384,6 +384,71 @@ def set_global_forwarding(session, enabled: bool):
     session.commit()
 
 
+def get_button_configs(rule: ForwardRule) -> List[Dict[str, Any]]:
+    """Return normalized multi-button settings, migrating the legacy single button in memory."""
+    raw = getattr(rule, "button_configs", None) or []
+    configs: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        try:
+            button_id = int(item.get("id", index))
+        except (TypeError, ValueError):
+            button_id = index
+        try:
+            position = int(item.get("position", index))
+        except (TypeError, ValueError):
+            position = index
+        configs.append({
+            "id": button_id,
+            "text": str(item.get("text") or item.get("button_text") or "Link")[:64],
+            "url": str(item.get("url") or item.get("button_url") or ""),
+            "keywords": list(item.get("keywords") or item.get("trigger_words") or []),
+            "color": item.get("color") if item.get("color") in BUTTON_COLORS else "default",
+            "position": max(1, position),
+            "enabled": bool(item.get("enabled", True)),
+        })
+    if configs:
+        return sorted(configs, key=lambda b: (b["position"], b["id"]))
+
+    # Backward compatibility with rules created before multi-button support.
+    legacy_text = getattr(rule, "button_text", None)
+    legacy_url = getattr(rule, "button_url", None)
+    if legacy_text and legacy_url:
+        keywords = getattr(rule, "button_trigger_words", None) or []
+        if isinstance(keywords, str):
+            keywords = [word.strip() for word in keywords.split(",") if word.strip()]
+        return [{
+            "id": 1, "text": str(legacy_text)[:64], "url": str(legacy_url),
+            "keywords": list(keywords), "color": "default", "position": 1,
+            "enabled": True,
+        }]
+    return []
+
+
+def save_button_configs(rule: ForwardRule, configs: List[Dict[str, Any]]) -> None:
+    """Persist normalized multi-button settings and mirror the first button to legacy fields."""
+    normalized = []
+    for index, item in enumerate(configs, start=1):
+        if not isinstance(item, dict):
+            continue
+        normalized.append({
+            "id": int(item.get("id", index)),
+            "text": str(item.get("text") or "Link")[:64],
+            "url": str(item.get("url") or ""),
+            "keywords": list(item.get("keywords") or []),
+            "color": item.get("color") if item.get("color") in BUTTON_COLORS else "default",
+            "position": max(1, int(item.get("position", index))),
+            "enabled": bool(item.get("enabled", True)),
+        })
+    rule.button_configs = normalized
+    # Keep legacy columns populated for compatibility with older code/backups.
+    first = normalized[0] if normalized else None
+    rule.button_text = first["text"] if first else None
+    rule.button_url = first["url"] if first else None
+    rule.button_trigger_words = list(first["keywords"]) if first else []
+
+
 def format_rule_summary(rule: ForwardRule) -> str:
 
     start = rule.schedule_start or "Any"
