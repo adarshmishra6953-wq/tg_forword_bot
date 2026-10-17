@@ -484,64 +484,6 @@ def format_rule_summary(rule: ForwardRule) -> str:
     )
 
 
-
-def next_button_id(configs: List[Dict[str, Any]]) -> int:
-    """Return the next unused stable button ID."""
-    used = set()
-    for item in configs or []:
-        try:
-            used.add(int(item.get("id")))
-        except (TypeError, ValueError, AttributeError):
-            continue
-    candidate = 1
-    while candidate in used:
-        candidate += 1
-    return candidate
-
-
-def button_management_keyboard(rule: ForwardRule) -> InlineKeyboardMarkup:
-    """Main menu for managing multiple keyword buttons."""
-    rid = rule.id
-    configs = get_button_configs(rule)
-    enabled_count = sum(1 for b in configs if b.get("enabled", True))
-    rows = [
-        [InlineKeyboardButton("➕ Add Button", callback_data=f"btn_add|{rid}")],
-        [InlineKeyboardButton("📋 View / Edit / Delete Buttons", callback_data=f"btn_list|{rid}")],
-    ]
-    if configs:
-        rows.extend([
-            [InlineKeyboardButton(f"🔴 Disable All ({enabled_count} enabled)", callback_data=f"btn_disable_all|{rid}")],
-            [InlineKeyboardButton(f"🟢 Enable All ({len(configs)} total)", callback_data=f"btn_enable_all|{rid}")],
-        ])
-    rows.append([InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"settings|{rid}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def button_list_keyboard(rule: ForwardRule) -> InlineKeyboardMarkup:
-    """List each configured button as a selectable item."""
-    rid = rule.id
-    configs = get_button_configs(rule)
-    rows = []
-    for item in configs:
-        status = "🟢" if item.get("enabled", True) else "🔴"
-        label = f"{status} #{item['id']} · {item['text']}"[:60]
-        rows.append([InlineKeyboardButton(label, callback_data=f"btn_item|{rid}|{item['id']}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"button_manage|{rid}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def single_button_keyboard(rule_id: int, button_id: int) -> InlineKeyboardMarkup:
-    """Actions available for one configured button."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔛 Enable / Disable", callback_data=f"btn_toggle|{rule_id}|{button_id}")],
-        [InlineKeyboardButton("↕️ Change Position", callback_data=f"btn_position|{rule_id}|{button_id}")],
-        [InlineKeyboardButton("🎨 Change Color", callback_data=f"btn_color|{rule_id}|{button_id}")],
-        [InlineKeyboardButton("🗑 Delete This Button", callback_data=f"btn_delete|{rule_id}|{button_id}")],
-        [InlineKeyboardButton("📋 Back to Button List", callback_data=f"btn_list|{rule_id}")],
-        [InlineKeyboardButton("⬅️ Button Manager", callback_data=f"button_manage|{rule_id}")],
-    ])
-
-
 # ------------------ Main Menu ------------------
 
 def main_menu_keyboard(global_enabled: bool = True):
@@ -2752,6 +2694,28 @@ def matching_buttons(rule: ForwardRule, messages) -> List[Dict[str, Any]]:
         if keywords and any(word and word.lower() in combined_text for word in keywords):
             matched.append(button)
     return sorted(matched, key=lambda b: (int(b.get("position", 1)), int(b.get("id", 1))))
+
+
+def make_url_button(button: Dict[str, Any]) -> InlineKeyboardButton:
+    """Build a URL button and apply its selected Telegram style when supported."""
+    text = str(button.get("text") or "Link")[:64]
+    url = str(button.get("url") or "").strip()
+    color = button.get("color", "default")
+
+    # A URL is required by Telegram. Invalid/empty configurations should not
+    # crash the entire forwarding task; use a safe placeholder URL only when
+    # a malformed stored configuration is encountered.
+    if not url.startswith(("https://", "http://", "tg://")):
+        url = "https://t.me/"
+
+    style = color if color in ("primary", "success", "danger") else None
+    if style:
+        try:
+            return InlineKeyboardButton(text=text, url=url, style=style)
+        except (TypeError, ValueError):
+            # Older python-telegram-bot versions do not expose the style field.
+            pass
+    return InlineKeyboardButton(text=text, url=url)
 
 
 def build_button_markup(buttons: List[Dict[str, Any]]):
