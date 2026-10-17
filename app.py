@@ -92,6 +92,14 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Telegram Bot API supported inline-button styles.
+BUTTON_COLORS = {
+    "default": "Default",
+    "primary": "Blue",
+    "success": "Green",
+    "danger": "Red",
+}
+
 
 # ------------------ Config ------------------
 
