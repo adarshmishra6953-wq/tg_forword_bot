@@ -1180,8 +1180,12 @@ def edit_contact_image_bytes(image_bytes: bytes, config: Dict[str, Any]) -> byte
     for key in ("channel", "manager"):
         mode = str(config.get(f"{key}_mode", "original")).lower()
         if mode == "original":
-            # Optional independent icon/label removal is still honored.
-            if not config.get(f"{key}_remove_icon") and not config.get(f"{key}_remove_label"):
+            # Keep processing when only an icon replacement/removal or label removal is requested.
+            if not (
+                config.get(f"{key}_remove_icon")
+                or config.get(f"{key}_remove_label")
+                or config.get(f"{key}_icon_text")
+            ):
                 continue
         mask = Image.new("L", (width, height), 0)
         manual_box = config.get(f"{key}_manual_box") if config.get("selection_mode") == "manual" else None
@@ -3728,11 +3732,4 @@ async def forward_message(
         ):
             album.append(message)
 
-        jobs = context.application.job_queue.get_jobs_by_name(
-            f"album:{key}"
-        )
-
-        for job in jobs:
-            job.schedule_removal()
-
-        context
+        jobs = context.application.job_queue.get_jobs_by_
