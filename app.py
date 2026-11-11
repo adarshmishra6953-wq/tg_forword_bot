@@ -19,6 +19,11 @@ Features:
 - Full backup/restore
 - Global forwarding ON/OFF
 - Keyword-based inline button system
+- Smart contact image restoration (OpenCV inpainting + Pillow fallback)
+- Independent channel/manager hide/replace controls
+- Solid/gradient fill, manual rectangle/brush masks, text/icon controls
+- Before/after preview and reusable per-rule editor presets
+- Parallel per-rule forwarding to reduce destination latency
 """
 
 import os
@@ -29,6 +34,7 @@ import json
 import urllib.parse
 import tempfile
 import io
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -87,6 +93,14 @@ try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
 except ImportError:
     Image = ImageDraw = ImageFont = ImageFilter = None
+
+# Optional high-quality restoration backend. Pillow fallback remains available.
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
 
 
 # ------------------ Logging ------------------
@@ -953,40 +967,101 @@ def restore_backup_data(session, data: Dict[str, Any]):
 CONTACT_EDITOR_DEFAULTS = {
     "channel_mode": "original",  # original | replace | hide
     "channel_username": "",
-    "manager_mode": "original",  # original | replace | hide
+    "manager_mode": "original",
     "manager_username": "",
     "enabled": True,
+    "fill_method": "smart",       # smart | clone | healing | solid | gradient
+    "selection_mode": "auto",    # auto | manual
+    "channel_manual_box": None,   # normalized x1,y1,x2,y2 (0..1)
+    "manager_manual_box": None,
+    "channel_manual_brush": [],
+    "manager_manual_brush": [],
+    "channel_remove_icon": False,
+    "manager_remove_icon": False,
+    "channel_icon_text": "",
+    "manager_icon_text": "",
+    "channel_remove_label": False,
+    "manager_remove_label": False,
+    "background_color": "#202020",
+    "gradient_start": "#202020",
+    "gradient_end": "#343434",
+    "font_color": "#FFE095",
+    "font_size": 0,              # 0 = automatic
+    "font_bold": True,
+    "channel_text_x": 0.5,       # relative center within username region
+    "manager_text_x": 0.5,
+    "quality": 95,
+    "ai_inpainting": False,      # reserved; requires a separately configured AI provider
+    "presets": [],
 }
 
 
 def get_contact_editor(rule):
     config = dict(CONTACT_EDITOR_DEFAULTS)
-    config.update(rule.contact_editor or {})
+    try:
+        config.update(rule.contact_editor or {})
+    except Exception:
+        pass
     return config
 
 
 def contact_editor_keyboard(rule):
     cfg = get_contact_editor(rule)
     rid = rule.id
-    def label(title, mode):
-        return f"{title}: {'Original' if mode == 'original' else 'Replace' if mode == 'replace' else 'Hide'}"
+    def mode_label(title, mode):
+        return f"{title}: {'Original' if mode == 'original' else 'Replace' if mode == 'replace' else 'Smart Hide'}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🟢 Editor: ON" if cfg.get("enabled", True) else "🔴 Editor: OFF", callback_data=f"ce_toggle|{rid}")],
-        [InlineKeyboardButton(label("Channel", cfg["channel_mode"]), callback_data=f"ce_channel|{rid}")],
-        [InlineKeyboardButton(label("Manager", cfg["manager_mode"]), callback_data=f"ce_manager|{rid}")],
-        [InlineKeyboardButton("✏️ Set Channel Username", callback_data=f"ce_set_channel|{rid}")],
-        [InlineKeyboardButton("✏️ Set Manager Username", callback_data=f"ce_set_manager|{rid}")],
-        [InlineKeyboardButton("👁️ Preview Settings", callback_data=f"ce_preview|{rid}")],
+        [InlineKeyboardButton(mode_label("Channel", cfg.get("channel_mode", "original")), callback_data=f"ce_channel|{rid}"),
+         InlineKeyboardButton(mode_label("Manager", cfg.get("manager_mode", "original")), callback_data=f"ce_manager|{rid}")],
+        [InlineKeyboardButton("✏️ Set Channel Username", callback_data=f"ce_set_channel|{rid}"),
+         InlineKeyboardButton("✏️ Set Manager Username", callback_data=f"ce_set_manager|{rid}")],
+        [InlineKeyboardButton(f"🧩 Fill: {cfg.get('fill_method','smart').title()}", callback_data=f"ce_fill|{rid}"),
+         InlineKeyboardButton(f"🎯 Selection: {cfg.get('selection_mode','auto').title()}", callback_data=f"ce_selection|{rid}")],
+        [InlineKeyboardButton("🎨 Set Solid Color", callback_data=f"ce_set_color|{rid}"),
+         InlineKeyboardButton("🌈 Set Gradient", callback_data=f"ce_set_gradient|{rid}")],
+        [InlineKeyboardButton("🧹 Channel Icon", callback_data=f"ce_icon_channel|{rid}"),
+         InlineKeyboardButton("🧹 Manager Icon", callback_data=f"ce_icon_manager|{rid}")],
+        [InlineKeyboardButton("🔁 Replace Channel Icon", callback_data=f"ce_set_icon_channel|{rid}"),
+         InlineKeyboardButton("🔁 Replace Manager Icon", callback_data=f"ce_set_icon_manager|{rid}")],
+        [InlineKeyboardButton("🏷 Channel Label", callback_data=f"ce_label_channel|{rid}"),
+         InlineKeyboardButton("🏷 Manager Label", callback_data=f"ce_label_manager|{rid}")],
+        [InlineKeyboardButton("▭ Set Channel Area", callback_data=f"ce_area_channel|{rid}"),
+         InlineKeyboardButton("▭ Set Manager Area", callback_data=f"ce_area_manager|{rid}")],
+        [InlineKeyboardButton("🖌 Channel Brush Mask", callback_data=f"ce_brush_channel|{rid}"),
+         InlineKeyboardButton("🖌 Manager Brush Mask", callback_data=f"ce_brush_manager|{rid}")],
+        [InlineKeyboardButton("🔤 Text Style", callback_data=f"ce_text_style|{rid}")],
+        [InlineKeyboardButton("💾 Save Preset", callback_data=f"ce_save_preset|{rid}"),
+         InlineKeyboardButton("📂 Apply Preset", callback_data=f"ce_apply_preset|{rid}")],
+        [InlineKeyboardButton("👁️ Before/After Preview", callback_data=f"ce_preview|{rid}")],
         [InlineKeyboardButton("♻️ Reset to Original", callback_data=f"ce_reset|{rid}")],
         [InlineKeyboardButton("⬅️ Back to Rule Settings", callback_data=f"settings|{rid}")],
     ])
 
 
-def _fit_text_font(draw, text_value, max_width, start_size=24):
+def _hex_rgb(value, fallback=(255, 224, 149)):
+    try:
+        value = str(value or "").strip().lstrip("#")
+        if len(value) == 3:
+            value = "".join(ch * 2 for ch in value)
+        if len(value) != 6:
+            return fallback
+        return tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
+    except Exception:
+        return fallback
+
+
+def _fit_text_font(draw, text_value, max_width, start_size=24, bold=True):
     if ImageFont is None:
         raise RuntimeError("Pillow is not installed. Add Pillow to requirements.txt")
-    candidates = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"]
-    for size in range(start_size, 9, -1):
+    candidates = (
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"]
+        if bold else
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"]
+    )
+    for size in range(max(9, int(start_size)), 8, -1):
         font = None
         for candidate in candidates:
             try:
@@ -996,23 +1071,95 @@ def _fit_text_font(draw, text_value, max_width, start_size=24):
                 pass
         if font is None:
             font = ImageFont.load_default()
-        if draw.textbbox((0, 0), text_value, font=font)[2] <= max_width:
+        try:
+            if draw.textbbox((0, 0), text_value, font=font)[2] <= max_width:
+                return font
+        except Exception:
             return font
     return ImageFont.load_default()
 
 
-def edit_contact_image_bytes(image_bytes: bytes, config: Dict[str, Any]) -> bytes:
-    """Replace/hide the two fixed username labels in the supplied banner sample.
+def _region_box(region, width, height):
+    x1, y1, x2, y2 = region
+    left = max(0, min(width - 1, int(float(x1) * width)))
+    top = max(0, min(height - 1, int(float(y1) * height)))
+    right = max(left + 1, min(width, int(float(x2) * width)))
+    bottom = max(top + 1, min(height, int(float(y2) * height)))
+    return left, top, right, bottom
 
-    Coordinates are normalized against the image dimensions, so resizing the
-    same template does not change the target regions. The rest of the image is
-    retained. A softly blurred local patch clears the previous username.
-    """
+
+def _paint_mask(mask, box, value=255):
+    x1, y1, x2, y2 = box
+    ImageDraw.Draw(mask).rectangle((x1, y1, max(x1, x2-1), max(y1, y2-1)), fill=value)
+
+
+def _restore_region(image, mask, config):
+    """Restore masked pixels with OpenCV inpainting; use deterministic clone fallback."""
+    if not mask.getbbox():
+        return image
+    method = str(config.get("fill_method", "smart")).lower()
+    if method in ("solid", "gradient"):
+        draw = ImageDraw.Draw(image)
+        bbox = mask.getbbox()
+        if method == "solid":
+            draw.rectangle(bbox, fill=_hex_rgb(config.get("background_color"), (32, 32, 32)))
+        else:
+            start = _hex_rgb(config.get("gradient_start"), (32, 32, 32))
+            end = _hex_rgb(config.get("gradient_end"), (52, 52, 52))
+            x1, y1, x2, y2 = bbox
+            span = max(1, y2 - y1)
+            for y in range(y1, y2):
+                t = (y - y1) / span
+                color = tuple(int(start[i] * (1-t) + end[i] * t) for i in range(3))
+                draw.line((x1, y, x2, y), fill=color)
+        return image
+
+    if cv2 is not None and np is not None:
+        try:
+            rgb = np.asarray(image.convert("RGB"))
+            m = np.asarray(mask.convert("L"))
+            # A modest dilation captures anti-aliased glyph edges without damaging nearby artwork.
+            kernel_size = 3 if method == "clone" else 5
+            kernel = np.ones((kernel_size, kernel_size), np.uint8)
+            m = cv2.dilate(m, kernel, iterations=1)
+            radius = 3 if method == "clone" else 5
+            flag = cv2.INPAINT_TELEA if method in ("smart", "healing") else cv2.INPAINT_NS
+            restored = cv2.inpaint(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), m, radius, flag)
+            restored = cv2.cvtColor(restored, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(restored)
+        except Exception:
+            logger.exception("OpenCV restoration failed; using Pillow clone fallback")
+
+    # Fallback: copy a nearby clean strip rather than blurring the removed content.
+    # Best for the supplied banner's flat/near-flat backgrounds.
+    result = image.copy()
+    bbox = mask.getbbox()
+    if not bbox:
+        return result
+    x1, y1, x2, y2 = bbox
+    width, height = result.size
+    strip = max(2, min(x2 - x1, int(width * 0.035)))
+    source = None
+    if x2 + strip <= width:
+        source = result.crop((x2, y1, min(width, x2 + strip), y2)).resize((x2-x1, y2-y1))
+    elif x1 - strip >= 0:
+        source = result.crop((max(0, x1-strip), y1, x1, y2)).resize((x2-x1, y2-y1))
+    if source:
+        result.paste(source, (x1, y1))
+    else:
+        # Last-resort neutral fill; never apply a blur patch.
+        avg = result.resize((1, 1)).getpixel((0, 0))
+        ImageDraw.Draw(result).rectangle(bbox, fill=avg)
+    return result
+
+
+def edit_contact_image_bytes(image_bytes: bytes, config: Dict[str, Any]) -> bytes:
+    """Edit the known banner template with inpainting/clone restoration, never Gaussian blur."""
     if Image is None:
         raise RuntimeError("Pillow is not installed. Install Pillow to enable image editing.")
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    with Image.open(io.BytesIO(image_bytes)) as opened:
+        image = opened.convert("RGB")
     width, height = image.size
-    # Fixed normalized coordinates for the supplied sample template.
     username_regions = {
         "channel": (0.294, 0.408, 0.474, 0.430),
         "manager": (0.615, 0.408, 0.795, 0.430),
@@ -1021,48 +1168,95 @@ def edit_contact_image_bytes(image_bytes: bytes, config: Dict[str, Any]) -> byte
         "channel": (0.230, 0.402, 0.500, 0.452),
         "manager": (0.550, 0.402, 0.800, 0.452),
     }
+    icon_regions = {
+        "channel": (0.230, 0.402, 0.285, 0.452),
+        "manager": (0.550, 0.402, 0.610, 0.452),
+    }
+    label_regions = {
+        "channel": (0.294, 0.432, 0.474, 0.452),
+        "manager": (0.615, 0.432, 0.795, 0.452),
+    }
+
     for key in ("channel", "manager"):
-        mode = config.get(f"{key}_mode", "original")
+        mode = str(config.get(f"{key}_mode", "original")).lower()
         if mode == "original":
-            continue
+            # Optional independent icon/label removal is still honored.
+            if not config.get(f"{key}_remove_icon") and not config.get(f"{key}_remove_label"):
+                continue
+        mask = Image.new("L", (width, height), 0)
+        manual_box = config.get(f"{key}_manual_box") if config.get("selection_mode") == "manual" else None
 
         if mode == "hide":
-            # Hide the complete contact block: Telegram icon, username and label.
-            x1, y1, x2, y2 = full_sections[key]
-            section_box = (int(x1*width), int(y1*height), int(x2*width), int(y2*height))
-            patch = image.crop(section_box).filter(ImageFilter.GaussianBlur(radius=max(8, int(height*0.008))))
-            image.paste(patch, section_box[:2])
-            continue
+            box = _region_box(manual_box, width, height) if manual_box else _region_box(full_sections[key], width, height)
+            _paint_mask(mask, box)
+        elif mode == "replace":
+            box = _region_box(manual_box, width, height) if manual_box else _region_box(username_regions[key], width, height)
+            _paint_mask(mask, box)
+        if config.get(f"{key}_remove_icon") or config.get(f"{key}_icon_text"):
+            _paint_mask(mask, _region_box(icon_regions[key], width, height))
+        if config.get(f"{key}_remove_label"):
+            _paint_mask(mask, _region_box(label_regions[key], width, height))
+        # Optional freehand-style brush mask supplied as normalized circles.
+        brush_points = config.get(f"{key}_manual_brush") or []
+        if config.get("selection_mode") == "manual" and brush_points:
+            brush_draw = ImageDraw.Draw(mask)
+            for point in brush_points:
+                try:
+                    px, py, pr = point
+                    cx, cy, radius = int(float(px) * width), int(float(py) * height), max(1, int(float(pr) * min(width, height)))
+                    brush_draw.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=255)
+                except Exception:
+                    continue
 
-        # Replace mode changes only the username line and preserves the icon
-        # and the small "OFFICIAL ..." caption below it.
-        x1, y1, x2, y2 = username_regions[key]
-        box = (int(x1*width), int(y1*height), int(x2*width), int(y2*height))
-        patch = image.crop(box).filter(ImageFilter.GaussianBlur(radius=max(2, int(height*0.0015))))
-        image.paste(patch, box[:2])
-        username = str(config.get(f"{key}_username") or "").strip()
-        if username:
-            draw = ImageDraw.Draw(image)
-            font = _fit_text_font(draw, username, box[2]-box[0]-4, max(12, int(height*0.020)))
-            bbox = draw.textbbox((0, 0), username, font=font, stroke_width=0)
-            text_w, text_h = bbox[2]-bbox[0], bbox[3]-bbox[1]
-            tx = box[0] + max(0, (box[2]-box[0]-text_w)//2)
-            ty = box[1] + max(0, (box[3]-box[1]-text_h)//2) - bbox[1]
-            draw.text((tx, ty), username, font=font, fill=(255, 224, 150), stroke_width=1, stroke_fill=(70, 18, 8))
+        image = _restore_region(image, mask, config)
+
+        icon_text = str(config.get(f"{key}_icon_text") or "").strip()
+        if icon_text:
+            draw_icon = ImageDraw.Draw(image)
+            icon_box = _region_box(icon_regions[key], width, height)
+            icon_font = _fit_text_font(draw_icon, icon_text[:4], icon_box[2]-icon_box[0]-2,
+                                       max(12, int(height*0.028)), True)
+            ib = draw_icon.textbbox((0, 0), icon_text[:4], font=icon_font)
+            iw, ih = ib[2]-ib[0], ib[3]-ib[1]
+            ix = icon_box[0] + max(0, (icon_box[2]-icon_box[0]-iw)//2)
+            iy = icon_box[1] + max(0, (icon_box[3]-icon_box[1]-ih)//2) - ib[1]
+            draw_icon.text((ix, iy), icon_text[:4], font=icon_font, fill=_hex_rgb(config.get("font_color")))
+
+        if mode == "replace":
+            username = str(config.get(f"{key}_username") or "").strip()
+            if username:
+                draw = ImageDraw.Draw(image)
+                box = _region_box(manual_box, width, height) if manual_box else _region_box(username_regions[key], width, height)
+                font_size = int(config.get("font_size") or max(12, int(height * 0.020)))
+                font = _fit_text_font(draw, username, box[2]-box[0]-4, font_size, bool(config.get("font_bold", True)))
+                bbox = draw.textbbox((0, 0), username, font=font)
+                text_w, text_h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                center = float(config.get(f"{key}_text_x", 0.5) or 0.5)
+                tx = box[0] + int((box[2]-box[0]) * max(0.0, min(1.0, center)) - text_w/2)
+                tx = max(box[0], min(box[2]-text_w, tx))
+                ty = box[1] + max(0, ((box[3]-box[1])-text_h)//2) - bbox[1]
+                fill = _hex_rgb(config.get("font_color"), (255, 224, 149))
+                draw.text((tx, ty), username, font=font, fill=fill,
+                          stroke_width=1, stroke_fill=(70, 18, 8))
+
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=95, optimize=True)
+    image.save(output, format="JPEG", quality=max(80, min(100, int(config.get("quality", 95)))), optimize=True)
     return output.getvalue()
 
 
 async def edited_photo_for_message(rule, message, context):
     cfg = get_contact_editor(rule)
-    if not cfg.get("enabled", True) or not any(cfg.get(k) != "original" for k in ("channel_mode", "manager_mode")):
+    if not cfg.get("enabled", True):
         return None
-    if not getattr(message, "photo", None):
+    active = any(cfg.get(k) != "original" for k in ("channel_mode", "manager_mode"))
+    active = active or any(cfg.get(f"{key}_{part}") for key in ("channel", "manager") for part in ("remove_icon", "remove_label", "icon_text"))
+    if not active or not getattr(message, "photo", None):
         return None
     tg_file = await context.bot.get_file(message.photo[-1].file_id)
     raw = await tg_file.download_as_bytearray()
-    return edit_contact_image_bytes(bytes(raw), cfg)
+    # CPU-bound image processing is moved off the event loop to avoid slowing other messages.
+    import asyncio
+    return await asyncio.to_thread(edit_contact_image_bytes, bytes(raw), cfg)
 
 
 # ------------------ Start Command ------------------
@@ -2152,7 +2346,7 @@ async def callback_handler(
             )
             return
 
-        if data.startswith(("ce_toggle|", "ce_channel|", "ce_manager|", "ce_set_channel|", "ce_set_manager|", "ce_reset|", "ce_preview|")):
+        if data.startswith(("ce_toggle|", "ce_channel|", "ce_manager|", "ce_set_channel|", "ce_set_manager|", "ce_reset|", "ce_preview|", "ce_fill|", "ce_selection|", "ce_set_color|", "ce_set_gradient|", "ce_icon_channel|", "ce_icon_manager|", "ce_label_channel|", "ce_label_manager|", "ce_area_channel|", "ce_area_manager|", "ce_brush_channel|", "ce_brush_manager|", "ce_text_style|", "ce_set_icon_channel|", "ce_set_icon_manager|", "ce_save_preset|", "ce_apply_preset|")):
             action, raw_rid = data.split("|", 1)
             rid = int(raw_rid)
             rule = session.get(ForwardRule, rid)
@@ -2177,6 +2371,57 @@ async def callback_handler(
             elif action == "ce_preview":
                 context.user_data["contact_editor_preview_rule"] = rid
                 await query.message.reply_text("Preview ke liye ab ek sample photo bhejein.")
+                return
+            elif action == "ce_fill":
+                methods = ["smart", "clone", "healing", "solid", "gradient"]
+                current = cfg.get("fill_method", "smart")
+                cfg["fill_method"] = methods[(methods.index(current) + 1) % len(methods)] if current in methods else "smart"
+            elif action == "ce_selection":
+                cfg["selection_mode"] = "manual" if cfg.get("selection_mode") != "manual" else "auto"
+            elif action in ("ce_set_color", "ce_set_gradient"):
+                context.user_data["contact_editor_input"] = {
+                    "rule_id": rid,
+                    "field": "background_color" if action == "ce_set_color" else "gradient_colors",
+                }
+                prompt = "Solid background color bhejein, jaise #202020." if action == "ce_set_color" else "Gradient ke do HEX colors comma se bhejein, jaise #202020,#343434."
+                await query.message.reply_text(prompt)
+                return
+            elif action in ("ce_icon_channel", "ce_icon_manager", "ce_label_channel", "ce_label_manager"):
+                key = "channel" if "channel" in action else "manager"
+                part = "remove_icon" if "_icon_" in action else "remove_label"
+                field = f"{key}_{part}"
+                cfg[field] = not bool(cfg.get(field, False))
+            elif action in ("ce_area_channel", "ce_area_manager"):
+                key = "channel" if "channel" in action else "manager"
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": f"{key}_manual_box"}
+                await query.message.reply_text("Manual rectangle ke coordinates bhejein: x1,y1,x2,y2. Har value 0-1000 ke beech. Example: 230,402,500,452")
+                return
+            elif action in ("ce_brush_channel", "ce_brush_manager"):
+                key = "channel" if "channel" in action else "manager"
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": f"{key}_manual_brush"}
+                await query.message.reply_text("Brush mask ke points bhejein: x,y,r;x,y,r. Values 0-1000 scale par. Example: 350,420,18;370,420,18;390,420,18")
+                return
+            elif action == "ce_text_style":
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": "text_style"}
+                await query.message.reply_text("Text style bhejein: size,color,bold,x. Example: 24,#FFE095,1,500 (size px, bold 1/0, x 0-1000 center position).")
+                return
+            elif action in ("ce_set_icon_channel", "ce_set_icon_manager"):
+                key = "channel" if "channel" in action else "manager"
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": f"{key}_icon_text"}
+                await query.message.reply_text("Icon replacement ke liye 1-4 ASCII characters bhejein, jaise TG, @, C, M. Yeh icon area mein text glyph ke roop mein draw hoga.")
+                return
+            elif action == "ce_save_preset":
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": "preset_name"}
+                await query.message.reply_text("Is Editor configuration ke preset ka naam bhejein.")
+                return
+            elif action == "ce_apply_preset":
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": "preset_apply"}
+                presets = cfg.get("presets") or []
+                if not presets:
+                    await query.message.reply_text("Is rule mein abhi koi saved preset nahi hai. Pehle Save Preset karein.")
+                    return
+                listing = "\n".join(f"{i+1}. {p.get('name','Preset')}" for i, p in enumerate(presets))
+                await query.message.reply_text("Preset number aur optional target Rule IDs bhejein. Format: preset_no ya preset_no;rule_id,rule_id\n" + listing)
                 return
             elif action == "ce_reset":
                 cfg = dict(CONTACT_EDITOR_DEFAULTS)
@@ -2256,19 +2501,127 @@ async def text_message_handler(
             if not rule:
                 await update.message.reply_text("Rule nahi mila.")
                 return
-            if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", text_value):
-                context.user_data["contact_editor_input"] = state
-                await update.message.reply_text("Valid Telegram username bhejein, jaise @MyChannel (5-32 characters).")
-                return
             cfg = get_contact_editor(rule)
-            cfg[state["field"]] = text_value
-            # Setting a username automatically selects Replace for that section.
-            cfg[state["field"].replace("_username", "_mode")] = "replace"
+            field = state["field"]
+            if field in ("channel_username", "manager_username"):
+                if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", text_value):
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Valid Telegram username bhejein, jaise @MyChannel (5-32 characters).")
+                    return
+                cfg[field] = text_value
+                cfg[field.replace("_username", "_mode")] = "replace"
+                confirmation = "Username save ho gaya."
+            elif field == "background_color":
+                if not re.fullmatch(r"#?[0-9A-Fa-f]{6}", text_value):
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Valid HEX color bhejein, jaise #202020.")
+                    return
+                cfg[field] = "#" + text_value.lstrip("#")
+                confirmation = "Solid background color save ho gaya."
+            elif field == "gradient_colors":
+                parts = [x.strip() for x in text_value.split(",")]
+                if len(parts) != 2 or not all(re.fullmatch(r"#?[0-9A-Fa-f]{6}", x) for x in parts):
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Do valid HEX colors comma se bhejein: #202020,#343434")
+                    return
+                cfg["gradient_start"], cfg["gradient_end"] = ["#" + x.lstrip("#") for x in parts]
+                cfg["fill_method"] = "gradient"
+                confirmation = "Gradient colors save ho gaye."
+            elif field in ("channel_manual_box", "manager_manual_box"):
+                try:
+                    vals = [int(x.strip()) for x in text_value.split(",")]
+                    if len(vals) != 4 or not (0 <= vals[0] < vals[2] <= 1000 and 0 <= vals[1] < vals[3] <= 1000):
+                        raise ValueError()
+                except Exception:
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Coordinates galat hain. Example: 230,402,500,452 (0-1000 scale).")
+                    return
+                cfg[field] = [v / 1000.0 for v in vals]
+                cfg["selection_mode"] = "manual"
+                confirmation = "Manual rectangle save ho gaya."
+            elif field in ("channel_manual_brush", "manager_manual_brush"):
+                try:
+                    points = []
+                    for item in text_value.split(";"):
+                        vals = [int(x.strip()) for x in item.split(",")]
+                        if len(vals) != 3 or not (0 <= vals[0] <= 1000 and 0 <= vals[1] <= 1000 and 1 <= vals[2] <= 200):
+                            raise ValueError()
+                        points.append([vals[0]/1000.0, vals[1]/1000.0, vals[2]/1000.0])
+                    if not points:
+                        raise ValueError()
+                except Exception:
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Brush points galat hain. Format: x,y,r;x,y,r (0-1000 scale).")
+                    return
+                cfg[field.replace("_manual_brush", "_manual_brush")] = points
+                cfg["selection_mode"] = "manual"
+                confirmation = "Manual brush mask save ho gaya."
+            elif field == "preset_name":
+                name = text_value[:40]
+                presets = list(cfg.get("presets") or [])
+                snapshot = {k: v for k, v in cfg.items() if k != "presets"}
+                presets.append({"name": name, "config": snapshot})
+                cfg["presets"] = presets[-30:]
+                confirmation = f"Preset '{name}' save ho gaya."
+            elif field == "preset_apply":
+                try:
+                    pieces = text_value.split(";", 1)
+                    preset_no = int(pieces[0].strip())
+                    presets = list(cfg.get("presets") or [])
+                    if not (1 <= preset_no <= len(presets)):
+                        raise ValueError()
+                    snapshot = presets[preset_no - 1].get("config") or {}
+                    target_ids = [int(x.strip()) for x in pieces[1].split(",") if x.strip()] if len(pieces) > 1 else [rule.id]
+                    if rule.id not in target_ids:
+                        target_ids.insert(0, rule.id)
+                    for target_id in target_ids:
+                        target = session.get(ForwardRule, target_id)
+                        if not target:
+                            continue
+                        existing = get_contact_editor(target)
+                        saved_presets = existing.get("presets", [])
+                        merged = dict(snapshot)
+                        merged["presets"] = saved_presets
+                        target.contact_editor = merged
+                        if target_id == rule.id:
+                            cfg = merged
+                    confirmation = "Preset selected Rules par apply ho gaya."
+                except Exception:
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Format galat hai. Example: 1 ya 1;12,13,14")
+                    return
+            elif field in ("channel_icon_text", "manager_icon_text"):
+                if len(text_value) > 4 or not text_value.isprintable():
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("1-4 printable characters bhejein.")
+                    return
+                cfg[field] = text_value
+                confirmation = "Custom icon text save ho gaya."
+            elif field == "text_style":
+                try:
+                    parts = [x.strip() for x in text_value.split(",")]
+                    if len(parts) != 4:
+                        raise ValueError()
+                    size = int(parts[0]); color = parts[1]; bold = parts[2] in ("1", "true", "yes")
+                    xpos = int(parts[3])
+                    if not (9 <= size <= 200 and re.fullmatch(r"#?[0-9A-Fa-f]{6}", color) and 0 <= xpos <= 1000):
+                        raise ValueError()
+                except Exception:
+                    context.user_data["contact_editor_input"] = state
+                    await update.message.reply_text("Format: size,color,bold,x. Example: 24,#FFE095,1,500")
+                    return
+                cfg["font_size"] = size
+                cfg["font_color"] = "#" + color.lstrip("#")
+                cfg["font_bold"] = bold
+                cfg["channel_text_x"] = cfg["manager_text_x"] = xpos / 1000.0
+                confirmation = "Text style save ho gaya."
+            else:
+                await update.message.reply_text("Unknown editor setting.")
+                return
             rule.contact_editor = cfg
             session.commit()
             await update.message.reply_text(
-                "Username save ho gaya.\n" +
-                f"Channel: {cfg['channel_mode']} | Manager: {cfg['manager_mode']}",
+                confirmation + f"\nChannel: {cfg['channel_mode']} | Manager: {cfg['manager_mode']}",
                 reply_markup=contact_editor_keyboard(rule),
             )
             return
@@ -2899,10 +3252,15 @@ async def contact_editor_preview_handler(update: Update, context: ContextTypes.D
         if not cfg.get("enabled", True):
             await update.message.reply_text("Editor OFF hai. Pehle ise ON karein.")
             return
-        edited = edit_contact_image_bytes(bytes(raw), cfg)
+        original_bytes = bytes(raw)
+        edited = await asyncio.to_thread(edit_contact_image_bytes, original_bytes, cfg)
+        await update.message.reply_photo(
+            photo=io.BytesIO(original_bytes),
+            caption="Before — Original Image",
+        )
         await update.message.reply_photo(
             photo=io.BytesIO(edited),
-            caption="Contact Editor Preview — agar sahi hai to settings save hain aur forwarding par apply hongi."
+            caption="After — Smart Background Editor Preview",
         )
         context.user_data.pop("contact_editor_preview_rule", None)
     except Exception as exc:
@@ -3071,7 +3429,12 @@ async def send_one(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     keyboard = get_keyword_button(rule, message)
-    edited_photo = await edited_photo_for_message(rule, message, context)
+    try:
+        edited_photo = await edited_photo_for_message(rule, message, context)
+    except Exception:
+        # Restoration failure must not block delivery: fall back to the original photo.
+        logger.exception("Contact image edit failed for rule %s; forwarding original media", rule.id)
+        edited_photo = None
     force_copy = text_modified or rule.forward_mode == "COPY" or keyboard is not None or edited_photo is not None
 
     if edited_photo is not None:
@@ -3181,9 +3544,17 @@ async def send_album(
             caption_text = f"{caption_text}\\n\\n{rule.footer_text}"
 
     media = []
+    # Download/process album photos concurrently; preserve original item order below.
+    edited_album_bytes = await asyncio.gather(
+        *(edited_photo_for_message(rule, message, context) for message in messages),
+        return_exceptions=True,
+    )
     for index, message in enumerate(messages):
         item_caption = caption_text if index == caption_index else None
-        edited_bytes = await edited_photo_for_message(rule, message, context)
+        edited_bytes = edited_album_bytes[index]
+        if isinstance(edited_bytes, Exception):
+            logger.warning("Album image edit failed; forwarding original item: %s", edited_bytes)
+            edited_bytes = None
         if edited_bytes is not None:
             item = InputMediaPhoto(media=io.BytesIO(edited_bytes), caption=item_caption)
         else:
@@ -3226,143 +3597,95 @@ async def send_album(
     return len(messages)
 
 
-async def process_single_message(
-    message,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
+async def _process_single_rule(message, rule_id, context):
+    """Process one destination rule in its own DB session; enables parallel fan-out."""
     session = Session()
-
     try:
         if not get_global_forwarding_enabled(session):
             return
-
-        rules = session.query(ForwardRule).filter(
-            ForwardRule.is_active == True
-        ).all()
-
-        for rule in rules:
-
-            if not source_matches(rule, message):
-                continue
-
-            if not time_in_schedule(
-                rule.schedule_start,
-                rule.schedule_end,
-            ):
-                continue
-
-            final_text, modified = prepare_text(rule, message)
-
-            if final_text is None:
-                continue
-
-            try:
-                if rule.forward_delay > 0:
-                    await asyncio_sleep(rule.forward_delay)
-
-                await send_one(
-                    rule,
-                    message,
-                    final_text,
-                    modified,
-                    context,
-                )
-
-                rule.forwarded_count = (
-                    rule.forwarded_count or 0
-                ) + 1
-
-                rule.last_triggered = datetime.utcnow()
-
-                session.commit()
-
-            except Exception as exc:
-                session.rollback()
-
-                logger.exception(
-                    "Forward error for rule %s",
-                    rule.id,
-                )
-
-                try:
-                    await context.bot.send_message(
-                        chat_id=FORCE_ADMIN_ID,
-                        text=(
-                            f"Forward error for rule #{rule.id}: "
-                            f"{exc}"
-                        ),
-                    )
-                except Exception:
-                    pass
-
+        rule = session.get(ForwardRule, int(rule_id))
+        if not rule or not rule.is_active or not source_matches(rule, message):
+            return
+        if not time_in_schedule(rule.schedule_start, rule.schedule_end):
+            return
+        final_text, modified = prepare_text(rule, message)
+        if final_text is None:
+            return
+        if rule.forward_delay and int(rule.forward_delay) > 0:
+            await asyncio.sleep(int(rule.forward_delay))
+        await send_one(rule, message, final_text, modified, context)
+        rule.forwarded_count = (rule.forwarded_count or 0) + 1
+        rule.last_triggered = datetime.utcnow()
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.exception("Forward error for rule %s", rule_id)
+        try:
+            await context.bot.send_message(chat_id=FORCE_ADMIN_ID, text=f"Forward error for rule #{rule_id}: {exc}")
+        except Exception:
+            pass
     finally:
         session.close()
 
 
-async def process_album_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def process_single_message(message, context: ContextTypes.DEFAULT_TYPE):
+    """Dispatch matching rules concurrently so one slow destination does not block others."""
+    session = Session()
+    try:
+        if not get_global_forwarding_enabled(session):
+            return
+        rule_ids = [r.id for r in session.query(ForwardRule).filter(ForwardRule.is_active == True).all()]
+    finally:
+        session.close()
+    if rule_ids:
+        await asyncio.gather(
+            *(_process_single_rule(message, rid, context) for rid in rule_ids),
+            return_exceptions=True,
+        )
 
+
+async def _process_album_rule(messages, rule_id, context):
+    session = Session()
+    try:
+        if not get_global_forwarding_enabled(session):
+            return
+        rule = session.get(ForwardRule, int(rule_id))
+        if not rule or not rule.is_active or not source_matches(rule, messages[0]):
+            return
+        if not time_in_schedule(rule.schedule_start, rule.schedule_end):
+            return
+        if rule.forward_delay and int(rule.forward_delay) > 0:
+            await asyncio.sleep(int(rule.forward_delay))
+        count = await send_album(rule, messages, context)
+        if count:
+            rule.forwarded_count = (rule.forwarded_count or 0) + count
+            rule.last_triggered = datetime.utcnow()
+            session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception("Album forwarding error for rule %s", rule_id)
+    finally:
+        session.close()
+
+
+async def process_album_job(context: ContextTypes.DEFAULT_TYPE):
     key = context.job.data
-
-    pending = context.application.bot_data.get(
-        "pending_albums",
-        {},
-    )
-
+    pending = context.application.bot_data.get("pending_albums", {})
     messages = pending.pop(key, [])
-
     if not messages:
         return
-
     session = Session()
-
     try:
         if not get_global_forwarding_enabled(session):
             return
-
-        rules = session.query(ForwardRule).filter(
-            ForwardRule.is_active == True
-        ).all()
-
-        for rule in rules:
-
-            if not source_matches(rule, messages[0]):
-                continue
-
-            if not time_in_schedule(
-                rule.schedule_start,
-                rule.schedule_end,
-            ):
-                continue
-
-            try:
-                count = await send_album(
-                    rule,
-                    messages,
-                    context,
-                )
-
-                if count:
-                    rule.forwarded_count = (
-                        rule.forwarded_count or 0
-                    ) + count
-
-                    rule.last_triggered = datetime.utcnow()
-
-                    session.commit()
-
-            except Exception:
-                session.rollback()
-
-                logger.exception(
-                    "Album forwarding error for rule %s",
-                    rule.id,
-                )
-
+        rule_ids = [r.id for r in session.query(ForwardRule).filter(ForwardRule.is_active == True).all()]
     finally:
         session.close()
+    if rule_ids:
+        await asyncio.gather(
+            *(_process_album_rule(messages, rid, context) for rid in rule_ids),
+            return_exceptions=True,
+        )
 
 
 async def forward_message(
@@ -3412,85 +3735,4 @@ async def forward_message(
         for job in jobs:
             job.schedule_removal()
 
-        context.application.job_queue.run_once(
-            process_album_job,
-            when=1.5,
-            data=key,
-            name=f"album:{key}",
-        )
-
-        return
-
-    await process_single_message(message, context)
-
-
-# ------------------ Application Setup ------------------
-
-def main():
-
-    application = Application.builder().token(
-        BOT_TOKEN
-    ).build()
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(callback_handler)
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            document_handler,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_message_handler,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.PHOTO & filters.ChatType.PRIVATE,
-            contact_editor_preview_handler,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.ALL,
-            forward_message,
-        )
-    )
-
-    port = int(os.environ.get("PORT", "8080"))
-
-    webhook_url = os.environ.get("WEBHOOK_URL")
-
-    if webhook_url:
-
-        logger.info("Starting webhook mode")
-
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{webhook_url}/{BOT_TOKEN}",
-        )
-
-    else:
-
-        logger.info("Starting polling mode")
-
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES
-        )
-
-
-if __name__ == "__main__":
-    main()
+        context
