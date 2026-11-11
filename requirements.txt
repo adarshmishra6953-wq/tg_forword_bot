@@ -3,3 +3,4 @@ flask
 SQLAlchemy
 psycopg2-binary
 psycopg[binary]
+Pillow>=10.0.0
