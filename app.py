@@ -28,6 +28,7 @@ import re
 import json
 import urllib.parse
 import tempfile
+import io
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -81,6 +82,11 @@ from sqlalchemy import (
 
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.mutable import MutableDict, MutableList
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+except ImportError:
+    Image = ImageDraw = ImageFont = ImageFilter = None
 
 
 # ------------------ Logging ------------------
@@ -206,6 +212,12 @@ class ForwardRule(Base):
         default=list,
     )
 
+    # Per-rule image contact editor: independent channel/manager modes.
+    contact_editor = Column(
+        MutableDict.as_mutable(PickleType),
+        default=dict,
+    )
+
     text_replacements = Column(
         MutableDict.as_mutable(PickleType),
         default=dict,
@@ -271,6 +283,7 @@ def ensure_tables_and_columns():
             "button_url": ("TEXT", "TEXT"),
             "button_trigger_words": ("BYTEA", "BLOB"),
             "button_configs": ("BYTEA", "BLOB"),
+            "contact_editor": ("BYTEA", "BLOB"),
             "forwarded_count": ("INTEGER", "INTEGER"),
             "last_triggered": ("TIMESTAMP", "DATETIME"),
         }
@@ -750,6 +763,12 @@ def rule_settings_keyboard(rule: ForwardRule):
         ],
         [
             InlineKeyboardButton(
+                "🖼️ Contact & Username Editor",
+                callback_data=f"contact_editor|{rid}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 "🕒 Set Schedule",
                 callback_data=f"set_schedule|{rid}",
             ),
@@ -810,6 +829,7 @@ def rule_to_dict(rule: ForwardRule) -> Dict[str, Any]:
         "button_url": rule.button_url,
         "button_trigger_words": list(rule.button_trigger_words or []),
         "button_configs": list(get_button_configs(rule)),
+        "contact_editor": dict(rule.contact_editor or {}),
         "forwarded_count": int(rule.forwarded_count or 0),
         "last_triggered": (
             rule.last_triggered.isoformat()
@@ -900,6 +920,7 @@ def restore_backup_data(session, data: Dict[str, Any]):
                 item.get("button_trigger_words") or []
             ),
             button_configs=list(item.get("button_configs") or []),
+            contact_editor=dict(item.get("contact_editor") or {}),
             forwarded_count=max(
                 0, int(item.get("forwarded_count", 0) or 0)
             ),
@@ -925,6 +946,123 @@ def restore_backup_data(session, data: Dict[str, Any]):
         meta.forwarding_enabled = enabled
 
     session.commit()
+
+
+# ------------------ Contact & Username Image Editor ------------------
+
+CONTACT_EDITOR_DEFAULTS = {
+    "channel_mode": "original",  # original | replace | hide
+    "channel_username": "",
+    "manager_mode": "original",  # original | replace | hide
+    "manager_username": "",
+    "enabled": True,
+}
+
+
+def get_contact_editor(rule):
+    config = dict(CONTACT_EDITOR_DEFAULTS)
+    config.update(rule.contact_editor or {})
+    return config
+
+
+def contact_editor_keyboard(rule):
+    cfg = get_contact_editor(rule)
+    rid = rule.id
+    def label(title, mode):
+        return f"{title}: {'Original' if mode == 'original' else 'Replace' if mode == 'replace' else 'Hide'}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Editor: ON" if cfg.get("enabled", True) else "🔴 Editor: OFF", callback_data=f"ce_toggle|{rid}")],
+        [InlineKeyboardButton(label("Channel", cfg["channel_mode"]), callback_data=f"ce_channel|{rid}")],
+        [InlineKeyboardButton(label("Manager", cfg["manager_mode"]), callback_data=f"ce_manager|{rid}")],
+        [InlineKeyboardButton("✏️ Set Channel Username", callback_data=f"ce_set_channel|{rid}")],
+        [InlineKeyboardButton("✏️ Set Manager Username", callback_data=f"ce_set_manager|{rid}")],
+        [InlineKeyboardButton("👁️ Preview Settings", callback_data=f"ce_preview|{rid}")],
+        [InlineKeyboardButton("♻️ Reset to Original", callback_data=f"ce_reset|{rid}")],
+        [InlineKeyboardButton("⬅️ Back to Rule Settings", callback_data=f"settings|{rid}")],
+    ])
+
+
+def _fit_text_font(draw, text_value, max_width, start_size=24):
+    if ImageFont is None:
+        raise RuntimeError("Pillow is not installed. Add Pillow to requirements.txt")
+    candidates = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"]
+    for size in range(start_size, 9, -1):
+        font = None
+        for candidate in candidates:
+            try:
+                font = ImageFont.truetype(candidate, size=size)
+                break
+            except Exception:
+                pass
+        if font is None:
+            font = ImageFont.load_default()
+        if draw.textbbox((0, 0), text_value, font=font)[2] <= max_width:
+            return font
+    return ImageFont.load_default()
+
+
+def edit_contact_image_bytes(image_bytes: bytes, config: Dict[str, Any]) -> bytes:
+    """Replace/hide the two fixed username labels in the supplied banner sample.
+
+    Coordinates are normalized against the image dimensions, so resizing the
+    same template does not change the target regions. The rest of the image is
+    retained. A softly blurred local patch clears the previous username.
+    """
+    if Image is None:
+        raise RuntimeError("Pillow is not installed. Install Pillow to enable image editing.")
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = image.size
+    # Fixed normalized coordinates for the supplied sample template.
+    username_regions = {
+        "channel": (0.294, 0.408, 0.474, 0.430),
+        "manager": (0.615, 0.408, 0.795, 0.430),
+    }
+    full_sections = {
+        "channel": (0.230, 0.402, 0.500, 0.452),
+        "manager": (0.550, 0.402, 0.800, 0.452),
+    }
+    for key in ("channel", "manager"):
+        mode = config.get(f"{key}_mode", "original")
+        if mode == "original":
+            continue
+
+        if mode == "hide":
+            # Hide the complete contact block: Telegram icon, username and label.
+            x1, y1, x2, y2 = full_sections[key]
+            section_box = (int(x1*width), int(y1*height), int(x2*width), int(y2*height))
+            patch = image.crop(section_box).filter(ImageFilter.GaussianBlur(radius=max(8, int(height*0.008))))
+            image.paste(patch, section_box[:2])
+            continue
+
+        # Replace mode changes only the username line and preserves the icon
+        # and the small "OFFICIAL ..." caption below it.
+        x1, y1, x2, y2 = username_regions[key]
+        box = (int(x1*width), int(y1*height), int(x2*width), int(y2*height))
+        patch = image.crop(box).filter(ImageFilter.GaussianBlur(radius=max(2, int(height*0.0015))))
+        image.paste(patch, box[:2])
+        username = str(config.get(f"{key}_username") or "").strip()
+        if username:
+            draw = ImageDraw.Draw(image)
+            font = _fit_text_font(draw, username, box[2]-box[0]-4, max(12, int(height*0.020)))
+            bbox = draw.textbbox((0, 0), username, font=font, stroke_width=0)
+            text_w, text_h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            tx = box[0] + max(0, (box[2]-box[0]-text_w)//2)
+            ty = box[1] + max(0, (box[3]-box[1]-text_h)//2) - bbox[1]
+            draw.text((tx, ty), username, font=font, fill=(255, 224, 150), stroke_width=1, stroke_fill=(70, 18, 8))
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=95, optimize=True)
+    return output.getvalue()
+
+
+async def edited_photo_for_message(rule, message, context):
+    cfg = get_contact_editor(rule)
+    if not cfg.get("enabled", True) or not any(cfg.get(k) != "original" for k in ("channel_mode", "manager_mode")):
+        return None
+    if not getattr(message, "photo", None):
+        return None
+    tg_file = await context.bot.get_file(message.photo[-1].file_id)
+    raw = await tg_file.download_as_bytearray()
+    return edit_contact_image_bytes(bytes(raw), cfg)
 
 
 # ------------------ Start Command ------------------
@@ -1996,6 +2134,63 @@ async def callback_handler(
             return
 
         # Global information
+        # Contact & Username Editor
+        if data.startswith("contact_editor|"):
+            rid = int(data.split("|", 1)[1])
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            cfg = get_contact_editor(rule)
+            await query.edit_message_text(
+                "🖼️ Contact & Username Editor\n\n"
+                f"Channel: {cfg['channel_mode']} ({cfg.get('channel_username') or 'not set'})\n"
+                f"Manager: {cfg['manager_mode']} ({cfg.get('manager_username') or 'not set'})\n"
+                f"Editor: {'ON' if cfg.get('enabled', True) else 'OFF'}\n\n"
+                "Har section ko Original, Replace ya Hide par set kar sakte hain.",
+                reply_markup=contact_editor_keyboard(rule),
+            )
+            return
+
+        if data.startswith(("ce_toggle|", "ce_channel|", "ce_manager|", "ce_set_channel|", "ce_set_manager|", "ce_reset|", "ce_preview|")):
+            action, raw_rid = data.split("|", 1)
+            rid = int(raw_rid)
+            rule = session.get(ForwardRule, rid)
+            if not rule:
+                await query.edit_message_text("Rule nahi mila.")
+                return
+            cfg = get_contact_editor(rule)
+            if action == "ce_toggle":
+                cfg["enabled"] = not cfg.get("enabled", True)
+            elif action in ("ce_channel", "ce_manager"):
+                key = "channel_mode" if action == "ce_channel" else "manager_mode"
+                current = cfg.get(key, "original")
+                cfg[key] = {"original": "replace", "replace": "hide", "hide": "original"}[current]
+            elif action == "ce_set_channel":
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": "channel_username"}
+                await query.message.reply_text("Naya Channel username bhejein (jaise @MyChannel).")
+                return
+            elif action == "ce_set_manager":
+                context.user_data["contact_editor_input"] = {"rule_id": rid, "field": "manager_username"}
+                await query.message.reply_text("Naya Manager username bhejein (jaise @MyManager).")
+                return
+            elif action == "ce_preview":
+                context.user_data["contact_editor_preview_rule"] = rid
+                await query.message.reply_text("Preview ke liye ab ek sample photo bhejein.")
+                return
+            elif action == "ce_reset":
+                cfg = dict(CONTACT_EDITOR_DEFAULTS)
+            rule.contact_editor = cfg
+            session.commit()
+            await query.edit_message_text(
+                "🖼️ Contact & Username Editor\n\n"
+                f"Channel: {cfg['channel_mode']} ({cfg.get('channel_username') or 'not set'})\n"
+                f"Manager: {cfg['manager_mode']} ({cfg.get('manager_username') or 'not set'})\n"
+                f"Editor: {'ON' if cfg.get('enabled', True) else 'OFF'}",
+                reply_markup=contact_editor_keyboard(rule),
+            )
+            return
+
         if data == "global_info":
 
             enabled = get_global_forwarding_enabled(session)
@@ -2054,6 +2249,30 @@ async def text_message_handler(
     session = Session()
 
     try:
+        # Save Contact & Username Editor values
+        if "contact_editor_input" in context.user_data:
+            state = context.user_data.pop("contact_editor_input")
+            rule = session.get(ForwardRule, int(state["rule_id"]))
+            if not rule:
+                await update.message.reply_text("Rule nahi mila.")
+                return
+            if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", text_value):
+                context.user_data["contact_editor_input"] = state
+                await update.message.reply_text("Valid Telegram username bhejein, jaise @MyChannel (5-32 characters).")
+                return
+            cfg = get_contact_editor(rule)
+            cfg[state["field"]] = text_value
+            # Setting a username automatically selects Replace for that section.
+            cfg[state["field"].replace("_username", "_mode")] = "replace"
+            rule.contact_editor = cfg
+            session.commit()
+            await update.message.reply_text(
+                "Username save ho gaya.\n" +
+                f"Channel: {cfg['channel_mode']} | Manager: {cfg['manager_mode']}",
+                reply_markup=contact_editor_keyboard(rule),
+            )
+            return
+
         # Create new forwarding rule
         if "creating_rule" in context.user_data:
             state = context.user_data["creating_rule"]
@@ -2658,6 +2877,41 @@ async def document_handler(
                 pass
 
 
+# ------------------ Contact Editor Preview Handler ------------------
+
+async def contact_editor_preview_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not admin_check(user.id):
+        return
+    rid = context.user_data.get("contact_editor_preview_rule")
+    if not rid:
+        return
+    session = Session()
+    try:
+        rule = session.get(ForwardRule, int(rid))
+        if not rule:
+            context.user_data.pop("contact_editor_preview_rule", None)
+            await update.message.reply_text("Rule nahi mila.")
+            return
+        tg_file = await context.bot.get_file(update.message.photo[-1].file_id)
+        raw = await tg_file.download_as_bytearray()
+        cfg = get_contact_editor(rule)
+        if not cfg.get("enabled", True):
+            await update.message.reply_text("Editor OFF hai. Pehle ise ON karein.")
+            return
+        edited = edit_contact_image_bytes(bytes(raw), cfg)
+        await update.message.reply_photo(
+            photo=io.BytesIO(edited),
+            caption="Contact Editor Preview — agar sahi hai to settings save hain aur forwarding par apply hongi."
+        )
+        context.user_data.pop("contact_editor_preview_rule", None)
+    except Exception as exc:
+        logger.exception("Contact editor preview failed")
+        await update.message.reply_text(f"Preview failed: {exc}")
+    finally:
+        session.close()
+
+
 # ------------------ Schedule Helper ------------------
 
 def time_in_schedule(
@@ -2817,7 +3071,17 @@ async def send_one(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     keyboard = get_keyword_button(rule, message)
-    force_copy = text_modified or rule.forward_mode == "COPY" or keyboard is not None
+    edited_photo = await edited_photo_for_message(rule, message, context)
+    force_copy = text_modified or rule.forward_mode == "COPY" or keyboard is not None or edited_photo is not None
+
+    if edited_photo is not None:
+        await context.bot.send_photo(
+            chat_id=rule.destination_chat_id,
+            photo=io.BytesIO(edited_photo),
+            caption=final_text or None,
+            reply_markup=keyboard,
+        )
+        return
 
     if rule.forward_mode == "FORWARD" and not force_copy:
         await context.bot.forward_message(
@@ -2919,7 +3183,11 @@ async def send_album(
     media = []
     for index, message in enumerate(messages):
         item_caption = caption_text if index == caption_index else None
-        item = media_to_input_media(message, caption=item_caption)
+        edited_bytes = await edited_photo_for_message(rule, message, context)
+        if edited_bytes is not None:
+            item = InputMediaPhoto(media=io.BytesIO(edited_bytes), caption=item_caption)
+        else:
+            item = media_to_input_media(message, caption=item_caption)
         if item is None:
             # Fallback to copy as a group if unsupported media type is present.
             copied = await context.bot.copy_messages(
@@ -3183,6 +3451,13 @@ def main():
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             text_message_handler,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO & filters.ChatType.PRIVATE,
+            contact_editor_preview_handler,
         )
     )
 
